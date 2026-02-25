@@ -1,0 +1,29 @@
+{
+  "name": "llm-client-bridge",
+  "version": "1.0.0",
+  "description": "Client-side bridge that accepts OpenAI-compatible HTTP requests and proxies them to the LLM shim over WebRTC",
+  "main": "dist/index.js",
+  "bin": {
+    "llm-client-bridge": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts"
+  },
+  "keywords": ["openai", "webrtc", "bridge", "proxy"],
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.21.0",
+    "commander": "^12.1.0",
+    "uuid": "^10.0.0",
+    "node-datachannel": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.0.0",
+    "@types/uuid": "^10.0.0",
+    "typescript": "^5.6.0",
+    "ts-node": "^10.9.0"
+  }
+}
