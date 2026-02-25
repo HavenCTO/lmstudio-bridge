@@ -16,7 +16,8 @@
   "dependencies": {
     "express": "5.2.1",
     "commander": "14.0.3",
-    "node-datachannel": "0.32.1"
+    "node-datachannel": "0.32.1",
+	"uuid":"13.0.0"
   },
   "devDependencies": {
     "@types/express": "5.0.6",
