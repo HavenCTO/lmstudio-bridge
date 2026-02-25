@@ -57,8 +57,8 @@ program
   .option("--lmstudio-token <token>", "LM Studio API token")
   .option(
     "--timeout <ms>",
-    "Request timeout to LM Studio in ms",
-    "120000"
+    "Request timeout to LM Studio in ms (0 = no timeout / infinite)",
+    "0"
   )
   .option("--no-logger", "Disable built-in logger middleware")
   // ── Gzip middleware ──

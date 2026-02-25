@@ -98,15 +98,30 @@ export function createHttpTransport(
 
   const start = (): Promise<void> => {
     return new Promise((resolve) => {
-      app.listen(opts.port, opts.host, () => {
+      const server = app.listen(opts.port, opts.host, () => {
         console.log(
           `[http] shim listening on http://${opts.host}:${opts.port}`
         );
         console.log(
           `[http] POST /v1/chat/completions for OpenAI-compatible requests`
         );
+        console.log(
+          `[http] timeouts disabled - waiting indefinitely for LLM responses`
+        );
         resolve();
       });
+
+      // Disable all timeouts on the HTTP server to allow long-running LLM inference
+      // server.timeout = 0 means no timeout (infinite)
+      server.timeout = 0;
+      // Keep-alive timeout - 0 disables it
+      server.keepAliveTimeout = 0;
+      // Headers timeout - 0 disables it  
+      server.headersTimeout = 0;
+      // Request timeout (Node 18+) - 0 disables it
+      if ('requestTimeout' in server) {
+        (server as any).requestTimeout = 0;
+      }
     });
   };
 
