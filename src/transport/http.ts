@@ -78,12 +78,22 @@ export function createHttpTransport(
     }
   );
 
-  // ── OpenAI-compatible Models list (passthrough placeholder) ──
+  // ── OpenAI-compatible Models list (proxy to LM Studio) ──
   app.get("/v1/models", async (_req: Request, res: Response) => {
-    res.json({
-      object: "list",
-      data: [],
-    });
+    try {
+      const models = await engine.getModels();
+      res.json(models);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      console.error(`[http] error fetching models:`, err);
+      res.status(502).json({
+        error: {
+          message: `LM Studio proxy error: ${message}`,
+          type: "server_error",
+          code: "proxy_error",
+        },
+      });
+    }
   });
 
   const start = (): Promise<void> => {

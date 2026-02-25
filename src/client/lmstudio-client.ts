@@ -81,13 +81,32 @@ export class LMStudioClient {
    */
   async ping(): Promise<boolean> {
     try {
-      const response = await fetch(`${this.options.baseUrl}/api/v1/models`, {
+      const response = await fetch(`${this.options.baseUrl}/v1/models`, {
         method: "GET",
         signal: AbortSignal.timeout(5000),
       });
       return response.ok;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * Get list of models from LM Studio.
+   */
+  async getModels(): Promise<{ object: string; data: any[] }> {
+    try {
+      const response = await fetch(`${this.options.baseUrl}/v1/models`, {
+        method: "GET",
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) {
+        throw new Error(`LM Studio returned ${response.status}`);
+      }
+      return await response.json() as { object: string; data: any[] };
+    } catch (err: unknown) {
+      console.error(`[lmstudio-client] failed to get models:`, err);
+      return { object: "list", data: [] };
     }
   }
 }

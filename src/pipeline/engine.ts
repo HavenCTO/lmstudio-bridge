@@ -91,4 +91,9 @@ export class Engine {
   async healthCheck(): Promise<boolean> {
     return this.client.ping();
   }
+
+  /** Fetch models from LM Studio */
+  async getModels(): Promise<{ object: string; data: any[] }> {
+    return this.client.getModels();
+  }
 }
