@@ -1,5 +1,6 @@
 /**
- * LM Studio REST API types for /api/v1/chat
+ * LM Studio types for internal use.
+ * Note: @lmstudio/sdk provides its own types; these are for our internal interfaces.
  */
 
 // ── Request Types ──
@@ -16,30 +17,10 @@ export interface LMStudioImageInput {
 
 export type LMStudioInputItem = LMStudioTextInput | LMStudioImageInput;
 
-export interface LMStudioPluginIntegration {
-  type: "plugin";
-  id: string;
-  allowed_tools?: string[];
-}
-
-export interface LMStudioEphemeralMCPIntegration {
-  type: "ephemeral_mcp";
-  server_label: string;
-  server_url: string;
-  allowed_tools?: string[];
-  headers?: Record<string, string>;
-}
-
-export type LMStudioIntegration =
-  | string
-  | LMStudioPluginIntegration
-  | LMStudioEphemeralMCPIntegration;
-
 export interface LMStudioChatRequest {
   model: string;
   input: string | LMStudioInputItem[];
   system_prompt?: string;
-  integrations?: LMStudioIntegration[];
   stream?: boolean;
   temperature?: number;
   top_p?: number;
@@ -47,10 +28,6 @@ export interface LMStudioChatRequest {
   min_p?: number;
   repeat_penalty?: number;
   max_output_tokens?: number;
-  reasoning?: "off" | "low" | "medium" | "high" | "on";
-  context_length?: number;
-  store?: boolean;
-  previous_response_id?: string;
 }
 
 // ── Response Types ──

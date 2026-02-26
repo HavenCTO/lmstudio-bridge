@@ -5,6 +5,7 @@
 import express, { Request, Response } from "express";
 import { Engine } from "../pipeline/engine";
 import { OpenAIChatCompletionRequest } from "../types";
+import { translateRequest, translateStreamingChunk } from "../pipeline/translator";
 
 export interface HttpTransportOptions {
   port: number;
@@ -54,11 +55,9 @@ export function createHttpTransport(
         }
 
         if (body.stream) {
-          // Streaming not yet supported – fall back to non-streaming
-          console.warn(
-            `[http] streaming requested but not yet implemented, falling back to non-streaming`
-          );
-          body.stream = false;
+          // Handle streaming request
+          await handleStreamingRequest(engine, body, res);
+          return;
         }
 
         const response = await engine.handleChatCompletion(body);
@@ -103,7 +102,7 @@ export function createHttpTransport(
           `[http] shim listening on http://${opts.host}:${opts.port}`
         );
         console.log(
-          `[http] POST /v1/chat/completions for OpenAI-compatible requests`
+          `[http] POST /v1/chat/completions for OpenAI-compatible requests (streaming supported)`
         );
         console.log(
           `[http] timeouts disabled - waiting indefinitely for LLM responses`
@@ -126,4 +125,46 @@ export function createHttpTransport(
   };
 
   return { start, app };
+}
+
+/**
+ * Handle streaming chat completion request using Server-Sent Events.
+ */
+async function handleStreamingRequest(
+  engine: Engine,
+  body: OpenAIChatCompletionRequest,
+  res: Response
+): Promise<void> {
+  // Set up SSE headers
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  try {
+    const stream = engine.handleChatCompletionStream(body);
+    const model = body.model;
+
+    for await (const chunk of stream) {
+      const sseData = `data: ${JSON.stringify(chunk)}\n\n`;
+      res.write(sseData);
+    }
+
+    // Send final [DONE] marker
+    res.write("data: [DONE]\n\n");
+    res.end();
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    console.error(`[http] streaming error:`, err);
+    
+    // Send error in SSE format
+    const errorChunk = {
+      error: {
+        message: `Streaming error: ${message}`,
+        type: "server_error",
+        code: "stream_error",
+      },
+    };
+    res.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+    res.end();
+  }
 }

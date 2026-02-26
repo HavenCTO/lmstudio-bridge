@@ -6,14 +6,15 @@ import { v4 as uuidv4 } from "uuid";
 import {
   OpenAIChatCompletionRequest,
   OpenAIChatCompletionResponse,
+  OpenAIChatCompletionChunk,
   ShimContext,
   RequestPayload,
   ResponsePayload,
   Middleware,
 } from "../types";
 import { MiddlewareRunner } from "./middleware-runner";
-import { translateRequest, translateResponse } from "./translator";
-import { LMStudioClient, LMStudioClientOptions } from "../client/lmstudio-client";
+import { translateRequest, translateResponse, translateStreamingChunk } from "./translator";
+import { LMStudioClient, LMStudioClientOptions, LMStudioStreamChunk } from "../client/lmstudio-client";
 
 export interface EngineOptions {
   lmstudio?: Partial<LMStudioClientOptions>;
@@ -95,5 +96,49 @@ export class Engine {
   /** Fetch models from LM Studio */
   async getModels(): Promise<{ object: string; data: any[] }> {
     return this.client.getModels();
+  }
+
+  /**
+   * Process a streaming chat completion request.
+   * Yields OpenAI-compatible chunks as they arrive from LM Studio.
+   */
+  async *handleChatCompletionStream(
+    openaiReq: OpenAIChatCompletionRequest
+  ): AsyncGenerator<OpenAIChatCompletionChunk> {
+    const context: ShimContext = {
+      requestId: uuidv4(),
+      receivedAt: Date.now(),
+      metadata: {},
+    };
+
+    // Step 1: Translate request
+    const lmsRequest = translateRequest(openaiReq);
+
+    // Step 2: Run request middleware
+    const reqPayload: RequestPayload = {
+      openaiRequest: openaiReq,
+      lmstudioRequest: lmsRequest,
+      context,
+    };
+    await this.pipeline.runRequest(reqPayload);
+
+    // Step 3: Stream from LM Studio
+    const streamId = `chatcmpl-${uuidv4().replace(/-/g, "").slice(0, 29)}`;
+    let chunkIndex = 0;
+
+    for await (const chunk of this.client.chatStream(reqPayload.lmstudioRequest)) {
+      // Translate each chunk to OpenAI format
+      yield translateStreamingChunk(
+        chunk,
+        streamId,
+        openaiReq.model,
+        chunkIndex++
+      );
+
+      // Stop if we got a finish reason
+      if (chunk.finishReason) {
+        break;
+      }
+    }
   }
 }

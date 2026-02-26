@@ -1,9 +1,20 @@
 /**
- * HTTP client for LM Studio's /api/v1/chat endpoint.
- * Uses native Node.js fetch (available in Node 18+).
+ * LM Studio SDK client for chat completion with VLM support.
+ * Uses @lmstudio/sdk for proper Vision-Language Model handling.
  */
 
-import { LMStudioChatRequest, LMStudioChatResponse } from "../types";
+import { LMStudioClient as SDKClient, Chat, FileHandle } from "@lmstudio/sdk";
+import {
+  LMStudioChatRequest,
+  LMStudioChatResponse,
+  LMStudioInputItem,
+} from "../types";
+
+/** Streaming chunk from LM Studio prediction */
+export interface LMStudioStreamChunk {
+  content: string;
+  finishReason: "stop" | "length" | null;
+}
 
 export interface LMStudioClientOptions {
   /** Base URL, default http://localhost:1234 */
@@ -16,84 +27,285 @@ export interface LMStudioClientOptions {
 
 const DEFAULTS: LMStudioClientOptions = {
   baseUrl: "http://localhost:1234",
-  timeoutMs: 0, // 0 = no timeout (infinite wait for LLM inference)
+  timeoutMs: 0,
 };
 
 export class LMStudioClient {
   private options: LMStudioClientOptions;
+  private sdkClient: SDKClient;
 
   constructor(options?: Partial<LMStudioClientOptions>) {
     this.options = { ...DEFAULTS, ...options };
     console.log(`[lmstudio-client] targeting ${this.options.baseUrl}`);
+
+    // Initialize SDK client with base URL
+    this.sdkClient = new SDKClient({
+      baseUrl: this.options.baseUrl,
+    });
   }
 
   /**
    * Send a chat request to LM Studio and return the response.
+   * Uses SDK with proper VLM image handling.
    */
   async chat(request: LMStudioChatRequest): Promise<LMStudioChatResponse> {
-    const url = `${this.options.baseUrl}/api/v1/chat`;
+    // Get the model - use specified model or any available
+    const model = request.model
+      ? await this.sdkClient.llm.model(request.model)
+      : await this.sdkClient.llm.model();
 
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
+    // Build SDK Chat from our request (async because of image preparation)
+    const chat = await this.buildChat(request);
 
-    if (this.options.apiToken) {
-      headers["Authorization"] = `Bearer ${this.options.apiToken}`;
+    // Configure prediction options
+    const predictionOpts: Record<string, unknown> = {};
+    if (request.temperature !== undefined) {
+      predictionOpts.temperature = request.temperature;
+    }
+    if (request.max_output_tokens !== undefined) {
+      predictionOpts.maxTokens = request.max_output_tokens;
+    }
+    if (request.top_p !== undefined) {
+      predictionOpts.topPSampling = request.top_p;
+    }
+    if (request.repeat_penalty !== undefined) {
+      predictionOpts.repeatPenalty = request.repeat_penalty;
     }
 
-    // Only use AbortController for explicit aborts, not for timeouts
-    // timeoutMs = 0 means infinite wait (no timeout)
-    const fetchOptions: RequestInit = {
-      method: "POST",
-      headers,
-      body: JSON.stringify(request),
-    };
+    // Get prediction
+    const prediction = model.respond(chat, predictionOpts);
 
-    // Only apply timeout if explicitly set (> 0)
-    let controller: AbortController | undefined;
-    let timeout: NodeJS.Timeout | undefined;
-    
+    // Wait for result with optional timeout
+    let result;
     if (this.options.timeoutMs > 0) {
-      controller = new AbortController();
-      timeout = setTimeout(() => controller!.abort(), this.options.timeoutMs);
-      fetchOptions.signal = controller.signal;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(
+          () => reject(new Error(`LM Studio request timed out after ${this.options.timeoutMs}ms`)),
+          this.options.timeoutMs
+        );
+      });
+      result = await Promise.race([prediction.result(), timeoutPromise]);
+    } else {
+      result = await prediction.result();
     }
 
+    // Convert SDK result to our response format
+    return this.convertResultToResponse(result);
+  }
+
+  /**
+   * Stream a chat request to LM Studio and yield chunks as they arrive.
+   * Uses SDK's async iteration for proper streaming support.
+   */
+  async *chatStream(request: LMStudioChatRequest): AsyncGenerator<LMStudioStreamChunk> {
+    // Get the model - use specified model or any available
+    const model = request.model
+      ? await this.sdkClient.llm.model(request.model)
+      : await this.sdkClient.llm.model();
+
+    // Build SDK Chat from our request (async because of image preparation)
+    const chat = await this.buildChat(request);
+
+    // Configure prediction options
+    const predictionOpts: Record<string, unknown> = {};
+    if (request.temperature !== undefined) {
+      predictionOpts.temperature = request.temperature;
+    }
+    if (request.max_output_tokens !== undefined) {
+      predictionOpts.maxTokens = request.max_output_tokens;
+    }
+    if (request.top_p !== undefined) {
+      predictionOpts.topPSampling = request.top_p;
+    }
+    if (request.repeat_penalty !== undefined) {
+      predictionOpts.repeatPenalty = request.repeat_penalty;
+    }
+
+    // Get prediction with streaming
+    const prediction = model.respond(chat, predictionOpts);
+
+    // Stream chunks using async iterator with optional timeout
+    let contentBuffer = "";
     try {
-      const response = await fetch(url, fetchOptions);
-
-      if (!response.ok) {
-        const body = await response.text();
-        throw new Error(
-          `LM Studio returned ${response.status}: ${body}`
-        );
+      if (this.options.timeoutMs > 0) {
+        // With timeout - need to wrap the iterator
+        const timeoutMs = this.options.timeoutMs;
+        const iterator = prediction[Symbol.asyncIterator]();
+        
+        while (true) {
+          const timeoutPromise = new Promise<never>((_, reject) => {
+            setTimeout(() => reject(new Error(`LM Studio stream timed out after ${timeoutMs}ms`)), timeoutMs);
+          });
+          
+          const { value, done } = await Promise.race([iterator.next(), timeoutPromise]);
+          if (done) break;
+          
+          const chunk = value as { content?: string };
+          if (chunk.content) {
+            contentBuffer += chunk.content;
+            yield { content: chunk.content, finishReason: null };
+          }
+        }
+      } else {
+        // No timeout - stream directly
+        for await (const chunk of prediction) {
+          const content = (chunk as { content?: string }).content;
+          if (content) {
+            contentBuffer += content;
+            yield { content, finishReason: null };
+          }
+        }
       }
-
-      const data = (await response.json()) as LMStudioChatResponse;
-      return data;
-    } catch (err: unknown) {
-      if (err instanceof Error && err.name === "AbortError" && this.options.timeoutMs > 0) {
-        throw new Error(
-          `LM Studio request timed out after ${this.options.timeoutMs}ms`
-        );
-      }
-      throw err;
-    } finally {
-      if (timeout) clearTimeout(timeout);
+      
+      // Final chunk with finish_reason
+      yield { content: "", finishReason: "stop" };
+    } catch (err) {
+      console.error(`[lmstudio-client] streaming error:`, err);
+      yield { content: "", finishReason: "stop" };
     }
   }
 
   /**
+   * Build SDK Chat object from our request format.
+   * Async due to image preparation.
+   */
+  private async buildChat(request: LMStudioChatRequest): Promise<Chat> {
+    const chat = Chat.empty();
+
+    // Add system prompt if present
+    if (request.system_prompt) {
+      chat.append("system", request.system_prompt);
+    }
+
+    // Build messages from input
+    const input = request.input;
+    if (typeof input === "string") {
+      // Simple text input
+      chat.append("user", input);
+    } else if (Array.isArray(input)) {
+      // Array of input items - handle text and images
+      const textParts: string[] = [];
+      const imageHandles: FileHandle[] = [];
+
+      for (const item of input) {
+        if (item.type === "message") {
+          textParts.push((item as LMStudioInputItem & { type: "message"; content: string }).content);
+        } else if (item.type === "image") {
+          // VLM: prepare image from data_url
+          const imageUrl = (item as LMStudioInputItem & { type: "image"; data_url: string }).data_url;
+          const handle = await this.prepareImageFromDataUrl(imageUrl);
+          if (handle) {
+            imageHandles.push(handle);
+          }
+        }
+      }
+
+      // Append message with images if any
+      const content = textParts.join("\n");
+      if (imageHandles.length > 0) {
+        chat.append("user", content, { images: imageHandles });
+      } else if (textParts.length > 0) {
+        chat.append("user", content);
+      }
+    }
+
+    return chat;
+  }
+
+  /**
+   * Prepare image from a data URL (data:image/xxx;base64,...).
+   * Returns FileHandle for SDK usage.
+   */
+  private async prepareImageFromDataUrl(dataUrl: string): Promise<FileHandle | null> {
+    try {
+      // Parse data URL format: data:image/png;base64,ABC123...
+      const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+      if (!match) {
+        console.warn(`[lmstudio-client] invalid image data URL format`);
+        return null;
+      }
+
+      const mimeType = match[1];
+      const base64Content = match[2];
+
+      // Determine file extension from MIME type
+      const ext = this.mimeTypeToExtension(mimeType);
+      const fileName = `image.${ext}`;
+
+      // Use SDK to prepare image from base64
+      return await this.sdkClient.files.prepareImageBase64(fileName, base64Content);
+    } catch (err) {
+      console.warn(`[lmstudio-client] failed to prepare image:`, err);
+      return null;
+    }
+  }
+
+  /**
+   * Convert MIME type to file extension.
+   */
+  private mimeTypeToExtension(mimeType: string): string {
+    const map: Record<string, string> = {
+      "image/png": "png",
+      "image/jpeg": "jpg",
+      "image/jpg": "jpg",
+      "image/gif": "gif",
+      "image/webp": "webp",
+      "image/bmp": "bmp",
+    };
+    return map[mimeType] || "bin";
+  }
+
+  /**
+   * Convert SDK prediction result to our response format.
+   */
+  private convertResultToResponse(result: {
+    content?: string;
+    stats?: {
+      inputTokens?: number;
+      outputTokens?: number;
+      tokensPerSecond?: number;
+      timeToFirstTokenSeconds?: number;
+    };
+    modelInfo?: {
+      identifier?: string;
+    };
+  }): LMStudioChatResponse {
+    const output: LMStudioChatResponse["output"] = [];
+
+    // Add message content if present
+    if (result.content) {
+      output.push({
+        type: "message",
+        content: result.content,
+      });
+    }
+
+    // Extract stats with fallbacks
+    const stats = result.stats || {};
+    const inputTokens = stats.inputTokens ?? 0;
+    const outputTokens = stats.outputTokens ?? 0;
+
+    return {
+      model_instance_id: result.modelInfo?.identifier ?? "unknown",
+      output,
+      stats: {
+        input_tokens: inputTokens,
+        total_output_tokens: outputTokens,
+        reasoning_output_tokens: 0,
+        tokens_per_second: stats.tokensPerSecond ?? 0,
+        time_to_first_token_seconds: stats.timeToFirstTokenSeconds ?? 0,
+      },
+    };
+  }
+
+  /**
    * Health check – tries to reach LM Studio.
-   * Uses a reasonable timeout (30s) since this is just a health check.
    */
   async ping(): Promise<boolean> {
     try {
-      const response = await fetch(`${this.options.baseUrl}/v1/models`, {
-        method: "GET",
-        signal: AbortSignal.timeout(30000), // 30s timeout for health check only
-      });
-      return response.ok;
+      // Try to list models as a health check
+      await this.sdkClient.llm.listLoaded();
+      return true;
     } catch {
       return false;
     }
@@ -101,18 +313,18 @@ export class LMStudioClient {
 
   /**
    * Get list of models from LM Studio.
-   * Uses a reasonable timeout (30s) since this is just a metadata fetch.
    */
   async getModels(): Promise<{ object: string; data: any[] }> {
     try {
-      const response = await fetch(`${this.options.baseUrl}/v1/models`, {
-        method: "GET",
-        signal: AbortSignal.timeout(30000), // 30s timeout for model list fetch
-      });
-      if (!response.ok) {
-        throw new Error(`LM Studio returned ${response.status}`);
-      }
-      return await response.json() as { object: string; data: any[] };
+      const models = await this.sdkClient.llm.listLoaded();
+      return {
+        object: "list",
+        data: models.map(m => ({
+          id: m.identifier,
+          object: "model",
+          owned_by: "lm-studio",
+        })),
+      };
     } catch (err: unknown) {
       console.error(`[lmstudio-client] failed to get models:`, err);
       return { object: "list", data: [] };

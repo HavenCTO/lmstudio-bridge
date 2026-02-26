@@ -1,11 +1,12 @@
 /**
- * Translators between OpenAI Chat Completions format and LM Studio /api/v1/chat format.
+ * Translators between OpenAI Chat Completions format and LM Studio SDK format.
  */
 
 import { v4 as uuidv4 } from "uuid";
 import {
   OpenAIChatCompletionRequest,
   OpenAIChatCompletionResponse,
+  OpenAIChatCompletionChunk,
   OpenAIChatMessage,
   OpenAIContentPart,
   OpenAIToolCall,
@@ -15,9 +16,10 @@ import {
   LMStudioMessageOutput,
   LMStudioToolCallOutput,
 } from "../types";
+import { LMStudioStreamChunk } from "../client/lmstudio-client";
 
 /**
- * Convert OpenAI Chat Completion request → LM Studio /api/v1/chat request.
+ * Convert OpenAI Chat Completion request → LM Studio SDK request format.
  */
 export function translateRequest(
   openai: OpenAIChatCompletionRequest
@@ -65,7 +67,7 @@ export function translateRequest(
 }
 
 /**
- * Convert LM Studio /api/v1/chat response → OpenAI Chat Completion response.
+ * Convert LM Studio SDK response → OpenAI Chat Completion response.
  */
 export function translateResponse(
   lms: LMStudioChatResponse,
@@ -139,14 +141,19 @@ function extractTextFromContent(
 
 /**
  * Build LM Studio input from an array of OpenAI messages.
- * If the conversation is a single user text message, return a plain string.
- * Otherwise build an array of input items.
+ * Supports VLM images via image_url content parts.
  */
 function buildInput(
   messages: OpenAIChatMessage[]
 ): string | LMStudioInputItem[] {
-  // Simple case: single user message with string content
+  // Check if we have any multi-modal content
+  const hasMultiModalContent = messages.some(
+    (msg) => Array.isArray(msg.content) && msg.content.some((p) => p.type === "image_url")
+  );
+
+  // Simple case: single user message with string content, no multi-modal
   if (
+    !hasMultiModalContent &&
     messages.length === 1 &&
     messages[0].role === "user" &&
     typeof messages[0].content === "string"
@@ -164,11 +171,14 @@ function buildInput(
       const prefix = msg.role !== "user" ? `[${msg.role}]: ` : "";
       items.push({ type: "message", content: `${prefix}${msg.content}` });
     } else if (Array.isArray(msg.content)) {
+      // Multi-modal content: text + images
       for (const part of msg.content) {
         if (part.type === "text" && part.text) {
           items.push({ type: "message", content: part.text });
         } else if (part.type === "image_url" && part.image_url) {
-          items.push({ type: "image", data_url: part.image_url.url });
+          // VLM: pass image data_url for SDK prepareImageBase64
+          const imageUrl = part.image_url.url;
+          items.push({ type: "image", data_url: imageUrl });
         }
       }
     }
@@ -177,4 +187,33 @@ function buildInput(
   return items.length === 1 && items[0].type === "message"
     ? items[0].content
     : items;
+}
+
+/**
+ * Convert LM Studio stream chunk → OpenAI Chat Completion chunk.
+ */
+export function translateStreamingChunk(
+  chunk: LMStudioStreamChunk,
+  streamId: string,
+  model: string,
+  chunkIndex: number
+): OpenAIChatCompletionChunk {
+  const isFirstChunk = chunkIndex === 0;
+  
+  return {
+    id: streamId,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: {
+          role: isFirstChunk ? "assistant" : undefined,
+          content: chunk.content || null,
+        },
+        finish_reason: chunk.finishReason,
+      },
+    ],
+  };
 }
