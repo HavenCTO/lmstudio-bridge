@@ -183,7 +183,9 @@ export function createSynapseUploader(opts: SynapseUploaderOptions): {
       carBytes,
       rootCid as any,
       {
+        logger: logger as any,
         contextId: path.basename(filePath),
+        ipniValidation: { enabled: false }, // Skip IPNI check to speed up startup
         onProgress: (event: { type: string }) => {
           if (event.type === "onUploadComplete") {
             onProgress?.({ bytesUploaded: carBytes.length, totalBytes: carBytes.length, percentage: 80 });
