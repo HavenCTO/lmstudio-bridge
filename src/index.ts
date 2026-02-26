@@ -93,7 +93,7 @@ program
   .option(
     "--synapse-rpc-url <url>",
     "Filecoin RPC WebSocket URL",
-    "wss://api.calibration.node.glif.io/rpc/v1"
+    "https://api.calibration.node.glif.io/rpc/v1"
   )
   // ── Shared key ──
   .option(

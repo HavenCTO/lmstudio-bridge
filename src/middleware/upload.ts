@@ -95,7 +95,7 @@ export interface SynapseUploaderOptions {
  * ```ts
  * const uploader = createSynapseUploader({
  *   privateKey: "0xabc...",
- *   rpcUrl: "wss://api.calibration.node.glif.io/rpc/v1",
+ *   rpcUrl: "https://api.calibration.node.glif.io/rpc/v1",
  * });
  * const mw = createUploadMiddleware({ synapseUpload: uploader.upload });
  * // later…
@@ -110,7 +110,7 @@ export function createSynapseUploader(opts: SynapseUploaderOptions): {
     ? opts.privateKey
     : `0x${opts.privateKey}`;
   const rpcUrl =
-    opts.rpcUrl ?? "wss://api.calibration.node.glif.io/rpc/v1";
+    opts.rpcUrl ?? "https://api.calibration.node.glif.io/rpc/v1";
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let synapseInstance: any = null;
@@ -136,10 +136,20 @@ export function createSynapseUploader(opts: SynapseUploaderOptions): {
 
     onProgress?.({ bytesUploaded: 0, totalBytes: fileSize, percentage: 0 });
 
+    // Create a minimal logger for Synapse SDK
+    const logger = {
+      info: (obj: Record<string, unknown>, msg: string) => console.log(`[synapse] ${msg}`, obj),
+      error: (obj: Record<string, unknown>, msg: string) => console.error(`[synapse] ${msg}`, obj),
+      warn: (obj: Record<string, unknown>, msg: string) => console.warn(`[synapse] ${msg}`, obj),
+      debug: (obj: Record<string, unknown>, msg: string) => console.debug(`[synapse] ${msg}`, obj),
+      trace: (obj: Record<string, unknown>, msg: string) => console.debug(`[synapse] ${msg}`, obj),
+      fatal: (obj: Record<string, unknown>, msg: string) => console.error(`[synapse] FATAL: ${msg}`, obj),
+    };
+
     // Initialise Synapse
     const synapse = await initializeSynapse(
       { privateKey, rpcUrl, telemetry: { sentryInitOptions: { enabled: false } } },
-      undefined // logger – uses console
+      logger as any
     );
     synapseInstance = synapse;
 
