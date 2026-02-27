@@ -82,7 +82,7 @@ export function createWebRTCTransport(
       return;
     }
 
-    const { PeerConnection } = nodeDataChannel;
+    const PeerConnection = (nodeDataChannel as unknown as { PeerConnection: unknown }).PeerConnection;
 
     let state: ConnectionState = "waiting";
     let peer: PeerState | null = null;
@@ -160,7 +160,17 @@ export function createWebRTCTransport(
         console.log(`[webrtc-shim] received SDP offer from client bridge`);
 
         // Step 2: Create PeerConnection (local network only, no STUN/TURN)
-        const pc = new PeerConnection("shim", {
+        type PCType = { 
+          setRemoteDescription: (sdp: string, type: string) => void;
+          localDescription: () => { sdp: string; type: string } | null;
+          createDataChannel: (label: string) => {
+            onMessage: (cb: (msg: string) => void) => void;
+            sendMessage: (msg: string) => void;
+          };
+          onDataChannel: (cb: (dc: unknown) => void) => void;
+          onStateChange: (cb: (state: string) => void) => void;
+        };
+        const pc = new (PeerConnection as unknown as new (name: string, opts: unknown) => PCType)("shim", {
           iceServers: [],
         });
 
