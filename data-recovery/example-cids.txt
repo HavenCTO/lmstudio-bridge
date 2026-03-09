@@ -1,0 +1,6 @@
+# Example CID List File
+# One CID per line, lines starting with # are ignored
+
+# Add your CIDs below:
+# bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi
+# bafybeidxfmwv5jxqk3qxqvz3xw5qvxqxqxqxqxqxqxqxqxqxqxqxqxqxq

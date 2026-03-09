@@ -1,0 +1,45 @@
+{
+  "name": "lmstudio-bridge-data-recovery",
+  "version": "1.0.0",
+  "description": "Data recovery tools for LM Studio Bridge testing data stored on IPFS/Synapse with TACo encryption",
+  "main": "dist/index.js",
+  "bin": {
+    "lmbridge-recover": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "recover": "node dist/cli.js recover",
+    "decrypt": "node dist/cli.js decrypt",
+    "extract": "node dist/cli.js extract",
+    "list": "node dist/cli.js list"
+  },
+  "keywords": [
+    "lmstudio",
+    "data-recovery",
+    "ipfs",
+    "synapse",
+    "tacO",
+    "ipld",
+    "car"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@ipld/car": "^5.0.0",
+    "@ipld/dag-json": "^10.0.0",
+    "commander": "14.0.3",
+    "ethers": "5.7.2",
+    "multiformats": "^13.0.0",
+    "@nucypher/taco": "0.7.0-alpha.12",
+    "@nucypher/taco-auth": "0.4.0-alpha.12"
+  },
+  "devDependencies": {
+    "@types/node": "25.3.0",
+    "typescript": "5.9.3",
+    "ts-node": "10.9.2"
+  },
+  "optionalDependencies": {
+    "filecoin-pin": "^0.16.0"
+  }
+}
