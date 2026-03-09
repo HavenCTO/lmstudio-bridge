@@ -30,6 +30,10 @@ import {
   EncryptMiddlewareHandle,
 } from "./middleware/encrypt";
 import {
+  createTacoEncryptMiddleware,
+  TacoEncryptMiddlewareHandle,
+} from "./middleware/taco-encrypt";
+import {
   createUploadMiddleware,
   createSynapseUploader,
 } from "./middleware/upload";
@@ -84,6 +88,32 @@ program
     "EVM chain for access-control conditions",
     "ethereum"
   )
+  // ── Encrypt middleware (TACo) ──
+  .option("--taco-encrypt", "Enable TACo threshold encryption", false)
+  .option(
+    "--taco-domain <domain>",
+    "TACo domain (e.g., lynx for DEVNET)",
+    "lynx"
+  )
+  .option(
+    "--taco-ritual-id <id>",
+    "TACo ritual ID for DKG",
+    "27"
+  )
+  .option(
+    "--dao-contract <address>",
+    "DAO token contract address for access control"
+  )
+  .option(
+    "--dao-chain <chain>",
+    "Blockchain chain for DAO token checks",
+    "sepolia"
+  )
+  .option(
+    "--dao-min-balance <balance>",
+    "Minimum token balance required for access",
+    "1"
+  )
   // ── Upload middleware (Synapse / Filecoin) ──
   .option("--upload", "Enable Synapse upload to Filecoin", false)
   .option(
@@ -119,11 +149,18 @@ const opts = program.opts<{
   // Gzip
   gzip: boolean;
   gzipLevel: string;
-  // Encrypt
+  // Encrypt (Lit)
   encrypt: boolean;
   litNetwork: string;
   walletAddress?: string;
   litChain: string;
+  // Encrypt (TACo)
+  tacoEncrypt: boolean;
+  tacoDomain: string;
+  tacoRitualId: string;
+  daoContract?: string;
+  daoChain: string;
+  daoMinBalance: string;
   // Upload
   upload: boolean;
   synapsePrivateKey?: string;
@@ -213,6 +250,50 @@ async function main(): Promise<void> {
     engine.use(encryptHandle.middleware);
     console.log(
       `[main] ✓ encrypt middleware enabled (network=${opts.litNetwork}, chain=${opts.litChain})`
+    );
+  }
+
+  // ── Encrypt middleware (TACo) ──
+
+  let tacoEncryptHandle: TacoEncryptMiddlewareHandle | null = null;
+
+  if (opts.tacoEncrypt) {
+    if (!opts.daoContract) {
+      console.error(
+        "[main] ✗ --dao-contract is required when --taco-encrypt is enabled"
+      );
+      process.exit(1);
+    }
+
+    const ritualId = parseInt(opts.tacoRitualId, 10);
+    if (isNaN(ritualId) || ritualId <= 0) {
+      console.error("[main] ✗ --taco-ritual-id must be a positive integer");
+      process.exit(1);
+    }
+
+    // Private key for encryption/signing (same as Synapse key or env var)
+    const privateKey =
+      opts.synapsePrivateKey || process.env.HAVEN_PRIVATE_KEY;
+
+    tacoEncryptHandle = createTacoEncryptMiddleware({
+      tacoDomain: opts.tacoDomain,
+      ritualId,
+      daoContractAddress: opts.daoContract,
+      daoChain: opts.daoChain,
+      minimumBalance: opts.daoMinBalance,
+      privateKey,
+      keyMetadataPath: opts.keyMetadata,
+    });
+
+    // Initialize TACo encryption
+    console.log(
+      `[main] initialising TACo encryption (domain=${opts.tacoDomain}, ritualId=${ritualId}, daoContract=${opts.daoContract})…`
+    );
+    await tacoEncryptHandle.initialize();
+
+    engine.use(tacoEncryptHandle.middleware);
+    console.log(
+      `[main] ✓ taco-encrypt middleware enabled (domain=${opts.tacoDomain}, ritualId=${ritualId})`
     );
   }
 
@@ -362,6 +443,10 @@ async function main(): Promise<void> {
     if (encryptHandle) {
       encryptHandle.destroy();
       console.log("[main] encrypt key material zeroed");
+    }
+    if (tacoEncryptHandle) {
+      tacoEncryptHandle.destroy();
+      console.log("[main] taco-encrypt key material zeroed");
     }
     if (litKeyEncryptor) {
       try {

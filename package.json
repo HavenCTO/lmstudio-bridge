@@ -1,7 +1,7 @@
 {
   "name": "llm-shim",
   "version": "1.0.0",
-  "description": "Lightweight shim that accepts OpenAI-compatible LLM requests and proxies to LM Studio",
+  "description": "Lightweight shim that accepts OpenAI-compatible LLM requests and proxies to LM Studio with TACo encryption support",
   "main": "dist/index.js",
   "bin": {
     "llm-shim": "dist/index.js"
@@ -13,20 +13,29 @@
     "test": "jest --testPathIgnorePatterns='e2e'",
     "test:watch": "jest --watch --testPathIgnorePatterns='e2e'",
     "test:coverage": "jest --coverage --testPathIgnorePatterns='e2e'",
-    "test:e2e": "node --loader ts-node/esm tests/e2e-ipld-flow.ts"
+    "test:e2e": "node --loader ts-node/esm tests/e2e-ipld-flow.ts",
+    "test:taco": "jest tests/taco --testPathIgnorePatterns='e2e'",
+    "test:taco:integration": "TEST_TACO_INTEGRATION_TEST=1 jest tests/taco/e2e.test.ts",
+    "test:taco:e2e": "node --loader ts-node/esm tests/taco/e2e.test.ts",
+    "test:taco:poc": "ts-node tests/taco/poc-test.ts"
   },
   "keywords": [
     "openai",
     "lmstudio",
     "shim",
-    "proxy"
+    "proxy",
+    "taco",
+    "threshold-access-control"
   ],
   "license": "MIT",
   "dependencies": {
+    "@nucypher/taco": "0.7.0-alpha.12",
+    "@nucypher/taco-auth": "0.4.0-alpha.12",
     "@ipld/car": "^5.0.0",
     "@ipld/dag-json": "^10.0.0",
     "@lmstudio/sdk": "^1.5.0",
     "commander": "14.0.3",
+    "ethers": "5.7.2",
     "express": "5.2.1",
     "ipns": "^9.0.0",
     "multiformats": "^13.0.0",
@@ -45,13 +54,7 @@
     "typescript": "5.9.3"
   },
   "optionalDependencies": {
-    "@lit-protocol/auth": "^8.2.3",
-    "@lit-protocol/constants": "^9.0.1",
-    "@lit-protocol/lit-client": "^8.3.1",
-    "@lit-protocol/lit-node-client": "^8.0.0-alpha.0",
-    "@lit-protocol/networks": "^8.4.1",
     "better-sqlite3": "^9.6.0",
-    "ethers": "^6.16.0",
     "filecoin-pin": "^0.16.0",
     "node-datachannel": "0.32.1"
   }
