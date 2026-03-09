@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment files (sensitive!)
+.env.local
+.env.*.local
+
+# Recovered data
+recovered/
+decrypted/
+extracted/
+
+# Cache directories
+.cache/
+.tmp/
+
+# CAR files (large)
+*.car
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
