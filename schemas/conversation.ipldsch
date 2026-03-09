@@ -1,0 +1,123 @@
+# IPLD Schema for LLM Shim Conversations
+# Using dag-json codec for JSON compatibility
+
+type Conversation struct {
+  version String (default "1.0.0")
+  request Request
+  response Response
+  metadata Metadata
+  timestamp Int
+  previousConversation optional Link<Conversation>
+}
+
+type Request struct {
+  model String
+  messages [Message]
+  parameters optional RequestParameters
+}
+
+type Message struct {
+  role String
+  content Content
+}
+
+type Content union {
+  String text
+  [ContentPart] parts
+} representation keyed
+
+type ContentPart struct {
+  type String
+  text optional String
+  image_url optional ImageURL
+}
+
+type ImageURL struct {
+  url String
+  detail optional String
+}
+
+type RequestParameters struct {
+  temperature optional Float
+  max_tokens optional Int
+  top_p optional Float
+  frequency_penalty optional Float
+  presence_penalty optional Float
+  stream optional Bool
+}
+
+type Response struct {
+  id String
+  model String
+  choices [Choice]
+  usage optional Usage
+  created Int
+}
+
+type Choice struct {
+  index Int
+  message Message
+  finish_reason String
+}
+
+type Usage struct {
+  prompt_tokens Int
+  completion_tokens Int
+  total_tokens Int
+}
+
+type Metadata struct {
+  shim_version String
+  capture_timestamp Int
+  encryption optional EncryptionMetadata
+  compression optional CompressionMetadata
+}
+
+type EncryptionMetadata struct {
+  encrypted Bool
+  encrypted_symmetric_key optional String
+  access_control_conditions optional String
+}
+
+type CompressionMetadata struct {
+  compressed Bool
+  algorithm optional String
+  original_size optional Int
+}
+
+# Session node for chaining conversations
+type SessionNode struct {
+  version String (default "1.0.0")
+  sessionId String
+  timestamp Int
+  previousSession optional Link<SessionNode>
+  conversations [Link<Conversation>]
+  encryptionMetadata optional Link<EncryptionMetadata>
+  statistics SessionStatistics
+}
+
+type SessionStatistics struct {
+  totalRequests Int
+  totalTokens Int
+  totalSize Int
+  duration Int  # milliseconds
+}
+
+# Index for efficient conversation lookup
+type ConversationIndex struct {
+  root Link<ConversationIndexNode>
+  version String (default "1.0.0")
+}
+
+type ConversationIndexNode struct {
+  entries [IndexEntry]
+  nextPage optional Link<ConversationIndexNode>
+}
+
+type IndexEntry struct {
+  conversationCid Link<Conversation>
+  timestamp Int
+  model String
+  firstUserMessage String
+  tokenCount Int
+}

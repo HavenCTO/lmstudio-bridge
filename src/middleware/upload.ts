@@ -1,32 +1,32 @@
 /**
- * Synapse (Filecoin) upload middleware.
+ * Synapse (Filecoin) upload middleware with IPLD-native CID caching.
  *
- * Writes the combined request + response payload (or its compressed /
- * encrypted form) to a temporary file and uploads it to Filecoin via
- * the Synapse SDK (`filecoin-pin`).
+ * This is a CLEAN BREAK refactor - no backwards compatibility with the old
+ * monolithic JSON format. All data uses IPLD structures.
  *
- * Picks the "best" buffer available in `context.metadata`:
- *   1. `encryptedBuffer` – if the encrypt middleware ran
- *   2. `gzipBuffer`      – if only gzip ran
- *   3. Falls back to serialising a combined `{ request, response }` JSON
- *
- * The request is captured during `onRequest` (if not already captured
- * by an earlier middleware) so the uploaded artifact always contains
- * both sides of the conversation.  This works transparently with all
- * OpenAI content formats including multi-part messages with inline
- * base64 images (`image_url` content parts).
+ * Flow:
+ * 1. Build IPLD DAG from request/response using IPLDBuilder
+ * 2. Check CID cache for deduplication
+ * 3. Create CAR file from IPLD blocks
+ * 4. Upload CAR to Filecoin via Synapse SDK
+ * 5. Cache root CID and component CIDs
  *
  * Required configuration:
  *   --upload                         Enable Synapse upload
- *   --synapse-private-key <hex>      Wallet private key (or HAVEN_PRIVATE_KEY env)
+ *   --synapse-private-key <hex>      Wallet private key
  *   --synapse-rpc-url <url>          Filecoin RPC URL
  *
  * After this middleware runs the following metadata keys are set:
- *   - `capturedRequest`  – the original OpenAI request (if not already set)
- *   - `uploadCid`        – the IPFS/Filecoin CID of the uploaded content
+ *   - `uploadCid`        – the root conversation CID
  *   - `uploadSize`       – bytes uploaded
  *   - `uploadTimestamp`  – ISO-8601 upload time
  *   - `uploadDealId`     – Filecoin deal ID (when available)
+ *   - `deduplicated`     – true if content was found in cache
+ *   - `rootCid`          – IPLD root CID
+ *   - `requestCid`       – Request node CID
+ *   - `responseCid`      – Response node CID
+ *   - `messageCids`      – Array of message CIDs
+ *   - `systemPromptCids` – Array of deduplicated system prompt CIDs
  */
 
 import * as fs from "fs";
@@ -37,22 +37,21 @@ import {
   RequestPayload,
   ResponsePayload,
   NextFunction,
+  OpenAIChatCompletionRequest,
 } from "../types";
+import { CIDCache } from "../lib/cid-cache";
+import { generateRawCID } from "../lib/cid-utils";
+import { createIPLDBuilder, createCAR, IPLDBuilder } from "../lib/ipld-builder";
+import { createPromptCache } from "../lib/prompt-cache";
 
 // ── Synapse upload function type ────────────────────────────────────────────
 
-/**
- * Upload progress event emitted by the upload function.
- */
 export interface UploadProgress {
   bytesUploaded: number;
   totalBytes: number;
   percentage: number;
 }
 
-/**
- * Result returned by the upload function.
- */
 export interface UploadResult {
   cid: string;
   size: number;
@@ -60,18 +59,6 @@ export interface UploadResult {
   dealId?: string;
 }
 
-/**
- * Callback that performs the actual Synapse upload.
- *
- * This indirection keeps the middleware unit-testable and avoids
- * hard-coupling to the Synapse SDK (which uses Deno-specific APIs
- * in js-services).
- *
- * The function receives:
- *   - filePath: absolute path to a temporary file to upload
- *   - onProgress: optional progress callback
- * And returns an `UploadResult`.
- */
 export type SynapseUploadFn = (
   filePath: string,
   onProgress?: (progress: UploadProgress) => void
@@ -79,29 +66,11 @@ export type SynapseUploadFn = (
 
 // ── Default Synapse SDK upload implementation ───────────────────────────────
 
-/**
- * Options for creating a real Synapse uploader backed by `filecoin-pin`.
- */
 export interface SynapseUploaderOptions {
-  /** Wallet private key (hex, with or without 0x prefix) */
   privateKey: string;
-  /** Filecoin RPC WebSocket URL */
   rpcUrl?: string;
 }
 
-/**
- * Create a `SynapseUploadFn` backed by the `filecoin-pin` SDK.
- *
- * ```ts
- * const uploader = createSynapseUploader({
- *   privateKey: "0xabc...",
- *   rpcUrl: "https://api.calibration.node.glif.io/rpc/v1",
- * });
- * const mw = createUploadMiddleware({ synapseUpload: uploader.upload });
- * // later…
- * await uploader.cleanup();
- * ```
- */
 export function createSynapseUploader(opts: SynapseUploaderOptions): {
   upload: SynapseUploadFn;
   cleanup: () => Promise<void>;
@@ -116,7 +85,6 @@ export function createSynapseUploader(opts: SynapseUploaderOptions): {
   let synapseInstance: any = null;
 
   const upload: SynapseUploadFn = async (filePath, onProgress) => {
-    // Dynamic imports so `filecoin-pin` is optional at install time
     const {
       createUnixfsCarBuilder,
     // @ts-ignore – optional dependency
@@ -130,13 +98,11 @@ export function createSynapseUploader(opts: SynapseUploaderOptions): {
     // @ts-ignore – optional dependency
     const { executeUpload, checkUploadReadiness } = await import("filecoin-pin/core/upload");
 
-    // Read file
     const fileData = fs.readFileSync(filePath);
     const fileSize = fileData.length;
 
     onProgress?.({ bytesUploaded: 0, totalBytes: fileSize, percentage: 0 });
 
-    // Create a minimal logger for Synapse SDK
     const logger = {
       info: (obj: Record<string, unknown>, msg: string) => console.log(`[synapse] ${msg}`, obj),
       error: (obj: Record<string, unknown>, msg: string) => console.error(`[synapse] ${msg}`, obj),
@@ -146,7 +112,6 @@ export function createSynapseUploader(opts: SynapseUploaderOptions): {
       fatal: (obj: Record<string, unknown>, msg: string) => console.error(`[synapse] FATAL: ${msg}`, obj),
     };
 
-    // Initialise Synapse
     const synapse = await initializeSynapse(
       { privateKey, rpcUrl, telemetry: { sentryInitOptions: { enabled: false } } },
       logger as any
@@ -155,14 +120,12 @@ export function createSynapseUploader(opts: SynapseUploaderOptions): {
 
     onProgress?.({ bytesUploaded: 0, totalBytes: fileSize, percentage: 10 });
 
-    // Build CAR file
     const carBuilder = createUnixfsCarBuilder();
     const carResult = await carBuilder.buildCar(filePath, { bare: true });
     const carBytes = fs.readFileSync(carResult.carPath);
 
     onProgress?.({ bytesUploaded: 0, totalBytes: carBytes.length, percentage: 20 });
 
-    // Check readiness
     await checkUploadReadiness({
       synapse,
       fileSize: carBytes.length,
@@ -171,12 +134,10 @@ export function createSynapseUploader(opts: SynapseUploaderOptions): {
 
     onProgress?.({ bytesUploaded: 0, totalBytes: carBytes.length, percentage: 30 });
 
-    // Create storage context
     const { storage, providerInfo } = await (createStorageContext as any)(synapse);
 
     onProgress?.({ bytesUploaded: 0, totalBytes: carBytes.length, percentage: 40 });
 
-    // Upload
     const rootCid = carResult.rootCid.toString();
     const uploadResult = await executeUpload(
       { synapse, storage, providerInfo },
@@ -185,7 +146,7 @@ export function createSynapseUploader(opts: SynapseUploaderOptions): {
       {
         logger: logger as any,
         contextId: path.basename(filePath),
-        ipniValidation: { enabled: false }, // Skip IPNI check to speed up startup
+        ipniValidation: { enabled: false },
         onProgress: (event: { type: string }) => {
           if (event.type === "onUploadComplete") {
             onProgress?.({ bytesUploaded: carBytes.length, totalBytes: carBytes.length, percentage: 80 });
@@ -196,7 +157,6 @@ export function createSynapseUploader(opts: SynapseUploaderOptions): {
       }
     );
 
-    // Cleanup CAR
     try { carBuilder.cleanup(carResult.carPath); } catch { /* ignore */ }
 
     onProgress?.({ bytesUploaded: carBytes.length, totalBytes: carBytes.length, percentage: 100 });
@@ -223,32 +183,29 @@ export function createSynapseUploader(opts: SynapseUploaderOptions): {
   return { upload, cleanup };
 }
 
-// ── Middleware factory ──────────────────────────────────────────────────────
+// ── Upload Options ──────────────────────────────────────────────────────────
 
 export interface UploadMiddlewareOptions {
-  /**
-   * Function that uploads a file to Filecoin/IPFS.
-   * Use `createSynapseUploader()` for the real SDK, or supply a stub.
-   */
   synapseUpload: SynapseUploadFn;
+  cidCache?: CIDCache;
+  promptCache?: ReturnType<typeof createPromptCache>;
 }
 
-/**
- * Create the Synapse upload middleware.
- */
+// ── IPLD Native Upload Middleware ───────────────────────────────────────────
+
 export function createUploadMiddleware(
   options: UploadMiddlewareOptions
 ): Middleware {
-  const { synapseUpload } = options;
+  const { synapseUpload, cidCache, promptCache } = options;
 
-    return {
+  return {
     name: "upload",
 
     async onRequest(
       payload: RequestPayload,
       next: NextFunction
     ): Promise<void> {
-      // Capture the request if not already captured by an earlier middleware (e.g. gzip, encrypt)
+      // Capture the request for IPLD building
       if (!payload.context.metadata.capturedRequest) {
         payload.context.metadata.capturedRequest = payload.openaiRequest;
       }
@@ -259,41 +216,70 @@ export function createUploadMiddleware(
       payload: ResponsePayload,
       next: NextFunction
     ): Promise<void> {
-      // Pick the best available buffer.
-      // encryptedBuffer and gzipBuffer already contain the combined
-      // request+response from upstream middleware.
-      let data: Buffer;
-      let label: string;
-      if (payload.context.metadata.encryptedBuffer) {
-        data = payload.context.metadata.encryptedBuffer as Buffer;
-        label = "encrypted";
-      } else if (payload.context.metadata.gzipBuffer) {
-        data = payload.context.metadata.gzipBuffer as Buffer;
-        label = "gzipped";
-      } else {
-        // No upstream processing — build combined { request, response } payload
-        const combined = {
-          request: payload.context.metadata.capturedRequest ?? null,
-          response: payload.openaiResponse,
-        };
-        data = Buffer.from(
-          JSON.stringify(combined),
-          "utf-8"
-        );
-        label = "raw JSON";
+      const request = payload.context.metadata.capturedRequest as OpenAIChatCompletionRequest;
+      const response = payload.openaiResponse;
+
+      // Create IPLD builder
+      const builder = createIPLDBuilder();
+
+      // Build IPLD DAG
+      const conversationRoot = await builder.buildConversation(request, response);
+
+      const rootCidString = conversationRoot.rootCid.toString();
+
+      // Check CID cache for deduplication
+      if (cidCache) {
+        const exists = await cidCache.has(rootCidString);
+        if (exists) {
+          const cachedEntry = await cidCache.get(rootCidString);
+          
+          payload.context.metadata.uploadCid = rootCidString;
+          payload.context.metadata.rootCid = rootCidString;
+          payload.context.metadata.requestCid = conversationRoot.requestCid.toString();
+          payload.context.metadata.responseCid = conversationRoot.responseCid.toString();
+          payload.context.metadata.messageCids = conversationRoot.messageCids.map(c => c.toString());
+          payload.context.metadata.uploadSize = cachedEntry?.size ?? conversationRoot.totalSize;
+          payload.context.metadata.uploadTimestamp = new Date(cachedEntry?.uploadedAt ?? Date.now()).toISOString();
+          payload.context.metadata.deduplicated = true;
+          
+          // Check for system prompt deduplication
+          if (promptCache && request.messages.length > 0 && request.messages[0].role === "system") {
+            const systemContent = typeof request.messages[0].content === "string"
+              ? request.messages[0].content
+              : JSON.stringify(request.messages[0].content);
+            const systemCid = await promptCache.get(systemContent);
+            if (systemCid) {
+              payload.context.metadata.systemPromptCids = [systemCid.toString()];
+            }
+          }
+
+          console.log(
+            `[upload] ${payload.context.requestId} | ⟲ DEDUPLICATED root=${rootCidString} (${conversationRoot.blockCount} blocks) - skipping upload`
+          );
+
+          await next();
+          return;
+        }
       }
 
-      // Write to temp file
+      // Create CAR file
+      const blocks = builder.getBlocks();
+      const car = await createCAR(conversationRoot.rootCid, blocks);
+
+      // Write CAR to temp file
       const tmpDir = os.tmpdir();
       const tmpFile = path.join(
         tmpDir,
-        `llm-shim-${payload.context.requestId}.bin`
+        `llm-shim-${payload.context.requestId}.car`
       );
-      fs.writeFileSync(tmpFile, data);
+      fs.writeFileSync(tmpFile, car.bytes);
 
       try {
         console.log(
-          `[upload] ${payload.context.requestId} | uploading ${label} (${data.length} bytes)…`
+          `[upload] ${payload.context.requestId} | IPLD DAG with ${conversationRoot.blockCount} blocks, ${car.bytes.length} bytes`
+        );
+        console.log(
+          `[upload] ${payload.context.requestId} | root=${rootCidString}`
         );
 
         const result = await synapseUpload(tmpFile, (p) => {
@@ -304,16 +290,75 @@ export function createUploadMiddleware(
           }
         });
 
+        // Set metadata for downstream middleware
         payload.context.metadata.uploadCid = result.cid;
+        payload.context.metadata.rootCid = rootCidString;
+        payload.context.metadata.requestCid = conversationRoot.requestCid.toString();
+        payload.context.metadata.responseCid = conversationRoot.responseCid.toString();
+        payload.context.metadata.messageCids = conversationRoot.messageCids.map(c => c.toString());
         payload.context.metadata.uploadSize = result.size;
         payload.context.metadata.uploadTimestamp = result.uploadedAt;
+        payload.context.metadata.deduplicated = false;
+
         if (result.dealId) {
           payload.context.metadata.uploadDealId = result.dealId;
         }
 
+        // Verify CID matches
+        if (result.cid !== rootCidString) {
+          console.warn(
+            `[upload] ${payload.context.requestId} | ⚠️ CID mismatch! local=${rootCidString}, server=${result.cid}`
+          );
+        }
+
         console.log(
-          `[upload] ${payload.context.requestId} | ✓ CID=${result.cid} (${result.size} bytes)`
+          `[upload] ${payload.context.requestId} | ✓ root=${result.cid} (${result.size} bytes)`
         );
+
+        // Add to CID cache
+        if (cidCache) {
+          await cidCache.add(rootCidString, {
+            size: result.size,
+            uploadedAt: Date.now(),
+            dealStatus: "pending",
+            mimeType: "application/vnd.ipld.car",
+          });
+
+          // Also cache individual component CIDs for granular deduplication
+          const componentEntries = [
+            { cid: conversationRoot.requestCid.toString(), size: 0 },
+            { cid: conversationRoot.responseCid.toString(), size: 0 },
+            { cid: conversationRoot.metadataCid.toString(), size: 0 },
+            ...conversationRoot.messageCids.map(c => ({ cid: c.toString(), size: 0 })),
+          ];
+
+          await cidCache.addBatch(componentEntries.map(e => ({
+            cid: e.cid,
+            size: e.size,
+            uploadedAt: Date.now(),
+            dealStatus: "pending",
+            mimeType: "application/vnd.ipld.dag-json",
+          })));
+        }
+
+        // Track system prompt deduplication
+        if (promptCache && request.messages.length > 0 && request.messages[0].role === "system") {
+          const systemContent = typeof request.messages[0].content === "string"
+            ? request.messages[0].content
+            : JSON.stringify(request.messages[0].content);
+          const existingCid = await promptCache.get(systemContent);
+          if (existingCid) {
+            payload.context.metadata.systemPromptCids = [existingCid.toString()];
+          } else {
+            // Get the CID of the first message (system prompt)
+            const systemMessageCid = conversationRoot.messageCids[0];
+            if (systemMessageCid) {
+              await promptCache.set(systemContent, systemMessageCid);
+              payload.context.metadata.systemPromptCids = [systemMessageCid.toString()];
+            }
+          }
+        }
+
       } finally {
         // Clean up temp file
         try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
