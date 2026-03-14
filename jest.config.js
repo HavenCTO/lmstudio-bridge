@@ -12,6 +12,7 @@ module.exports = {
         useESM: false,
         tsconfig: {
           allowJs: true,
+          types: ['jest', 'node'],
         },
       },
     ],

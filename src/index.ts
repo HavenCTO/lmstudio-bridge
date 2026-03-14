@@ -22,6 +22,13 @@ import { Command } from "commander";
 import { Engine } from "./pipeline/engine";
 import { createHttpTransport } from "./transport/http";
 import { createWebRTCTransport } from "./transport/webrtc";
+import { createLibp2pTransport } from "./transport/libp2p";
+import {
+  IpfsDaemonNotRunningError,
+  Libp2pStreamMountingDisabledError,
+  P2PProtocolInUseError,
+  IpfsApiUrlError,
+} from "./utils/ipfs-api";
 import { loggerMiddleware } from "./middleware/logger";
 import { createGzipMiddleware } from "./middleware/gzip";
 import {
@@ -135,6 +142,18 @@ program
     "--cid-log <path>",
     "Directory for Parquet CID logs (default: ./cids)"
   )
+  // ── Libp2p transport options ──
+  .option("--libp2p", "Use libp2p transport (IPFS p2p tunnel)", false)
+  .option(
+    "--libp2p-protocol <name>",
+    "Libp2p protocol name for the tunnel",
+    "/x/llmshim"
+  )
+  .option(
+    "--ipfs-api-url <url>",
+    "Kubo IPFS daemon HTTP RPC API URL",
+    "http://127.0.0.1:5001"
+  )
   .parse(process.argv);
 
 const opts = program.opts<{
@@ -169,10 +188,39 @@ const opts = program.opts<{
   keyMetadata?: string;
   // CID recorder
   cidLog?: string;
+  // Libp2p
+  libp2p: boolean;
+  libp2pProtocol: string;
+  ipfsApiUrl: string;
 }>();
 
-// Default to HTTP if neither flag is set
-const transport = opts.webrtc ? "webrtc" : "http";
+// ── Transport selection with mutual exclusivity ──
+const transportFlags = [opts.http, opts.webrtc, opts.libp2p].filter(Boolean);
+if (transportFlags.length > 1) {
+  console.error(
+    "Error: Only one transport mode can be active. Choose --http, --webrtc, or --libp2p."
+  );
+  process.exit(1);
+}
+
+// Validate libp2p-specific flags
+if (opts.libp2p) {
+  if (!opts.libp2pProtocol.startsWith("/x/")) {
+    console.error(
+      "Error: --libp2p-protocol must start with /x/ (e.g., /x/llmshim)"
+    );
+    process.exit(1);
+  }
+}
+
+let transport: "http" | "webrtc" | "libp2p";
+if (opts.libp2p) {
+  transport = "libp2p";
+} else if (opts.webrtc) {
+  transport = "webrtc";
+} else {
+  transport = "http";
+}
 
 async function main(): Promise<void> {
   console.log("╔══════════════════════════════════════╗");
@@ -418,7 +466,17 @@ async function main(): Promise<void> {
   }
 
   // Start transport
-  if (transport === "webrtc") {
+  let libp2pTransport: { start: () => Promise<void>; shutdown: () => Promise<void> } | null = null;
+
+  if (transport === "libp2p") {
+    console.log(`[main] starting libp2p transport...`);
+    libp2pTransport = createLibp2pTransport(engine, {
+      port: parseInt(opts.port, 10),
+      protocol: opts.libp2pProtocol,
+      ipfsApiUrl: opts.ipfsApiUrl,
+    });
+    await libp2pTransport.start();
+  } else if (transport === "webrtc") {
     console.log(`[main] starting WebRTC transport...`);
     const webrtc = createWebRTCTransport(engine, {
       port: parseInt(opts.port, 10),
@@ -454,6 +512,11 @@ async function main(): Promise<void> {
         console.log("[main] Lit Protocol disconnected");
       } catch { /* ignore */ }
     }
+    // Close libp2p tunnel (via HTTP RPC, not CLI)
+    if (libp2pTransport) {
+      await libp2pTransport.shutdown();
+      console.log("[main] libp2p tunnel closed");
+    }
     if (cidRecorder) {
       try {
         await cidRecorder.close();
@@ -473,6 +536,17 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
+  // Known libp2p errors — print clean message without stack trace
+  if (
+    err instanceof IpfsDaemonNotRunningError ||
+    err instanceof Libp2pStreamMountingDisabledError ||
+    err instanceof P2PProtocolInUseError ||
+    err instanceof IpfsApiUrlError
+  ) {
+    console.error(`\n${err.message}\n`);
+    process.exit(1);
+  }
+  // Unknown error — print with stack trace
   console.error("[main] fatal error:", err);
   process.exit(1);
 });

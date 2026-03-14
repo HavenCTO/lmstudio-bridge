@@ -1,6 +1,6 @@
 # LLM Shim + Client Bridge
 
-A lightweight Node.js/TypeScript system that accepts OpenAI-compatible LLM requests and proxies them to [LM Studio](https://lmstudio.ai). Supports **HTTP** (direct) and **WebRTC** (via client bridge) transport modes.
+A lightweight Node.js/TypeScript system that accepts OpenAI-compatible LLM requests and proxies them to [LM Studio](https://lmstudio.ai). Supports **HTTP** (direct), **WebRTC** (via client bridge), and **libp2p** (IPFS P2P tunnel) transport modes.
 
 ## Architecture
 
@@ -24,6 +24,24 @@ A lightweight Node.js/TypeScript system that accepts OpenAI-compatible LLM reque
 │                           │                                            │
 │                    [Shim :8081] ──HTTP──▶ [LM Studio :1234]           │
 │                    POST /pair (control)                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    LIBP2P MODE (IPFS P2P tunnel)                       │
+│                                                                        │
+│  LLM Client ──HTTP──▶ [Client Bridge :8080]                           │
+│              POST /v1/chat/completions                                 │
+│                           │                                            │
+│                      libp2p tunnel                                     │
+│                      (IPFS p2p forward/listen,                         │
+│                       Noise encryption, DCUtR NAT traversal)           │
+│                           │                                            │
+│                    [Shim :8080 on 127.0.0.1]                          │
+│                           │                                            │
+│                    engine.handleChatCompletion()                        │
+│                    → middleware pipeline (gzip/encrypt/upload)          │
+│                           │                                            │
+│                    [LM Studio :1234]                                   │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -119,6 +137,43 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
+### Libp2p Mode (IPFS P2P Tunnel)
+
+**Prerequisites:**
+- Kubo v0.40+ installed on both machines
+- `Experimental.Libp2pStreamMounting` enabled: `ipfs config --json Experimental.Libp2pStreamMounting true`
+- IPFS daemon running: `ipfs daemon &`
+
+**Terminal 1 – Start the Shim (server side):**
+```bash
+cd /path/to/shim
+npm install && npm run build
+node dist/index.js --libp2p --port 8080
+# Note the PeerID printed in the logs
+```
+
+**Terminal 2 – Start the Client Bridge (client side):**
+```bash
+cd /path/to/shim/client-bridge
+npm install && npm run build
+node dist/index.js --libp2p --peerid 12D3KooW... --port 8080
+```
+
+**Terminal 3 – Send requests:**
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "your-model-id",
+    "messages": [{"role": "user", "content": "Hello via libp2p!"}]
+  }'
+```
+
+**With full middleware pipeline:**
+```bash
+node dist/index.js --libp2p --port 8080 --gzip --encrypt --wallet-address 0x... --upload --synapse-private-key 0x...
+```
+
 ## CLI Reference
 
 ### LLM Shim (`llm-shim`)
@@ -151,6 +206,11 @@ Upload Middleware (Synapse / Filecoin):
   --synapse-rpc-url <url>       Filecoin RPC WebSocket URL
                                 (default: wss://api.calibration.node.glif.io/rpc/v1)
   --no-upload-metadata          Skip uploading encryption metadata as separate file
+
+Libp2p Transport (IPFS P2P Tunnel):
+  --libp2p                      Use libp2p transport (IPFS p2p tunnel)
+  --libp2p-protocol <name>      Libp2p protocol name (default: /x/llmshim)
+  --ipfs-api-url <url>          Kubo IPFS daemon HTTP RPC API URL (default: http://127.0.0.1:5001)
 ```
 
 #### Middleware Pipeline Examples
@@ -195,11 +255,17 @@ These are **not** required at build time. If not installed, the middleware will 
 
 ```
 Options:
-  --shim-url <url>           URL of the shim's control server (required)
-  --port <number>            Port for local OpenAI-compatible API (default: 8080)
-  --host <address>           Bind address for local API (default: 127.0.0.1)
-  --signaling-port <number>  Port for ephemeral signaling server (default: 0 = random)
-  --timeout <ms>             Request timeout for LLM requests (default: 120000)
+  --shim-url <url>              URL of the shim's control server (required for WebRTC)
+  --port <number>               Port for local OpenAI-compatible API (default: 8080)
+  --host <address>              Bind address for local API (default: 127.0.0.1)
+  --signaling-port <number>     Port for ephemeral signaling server (default: 0 = random)
+  --timeout <ms>                Request timeout for LLM requests (default: 120000)
+
+Libp2p Transport:
+  --libp2p                      Use libp2p transport (IPFS p2p tunnel)
+  --peerid <id>                 PeerID of the remote shim (required with --libp2p)
+  --libp2p-protocol <name>      Libp2p protocol name (default: /x/llmshim)
+  --ipfs-api-url <url>          Kubo IPFS daemon HTTP RPC API URL (default: http://127.0.0.1:5001)
 ```
 
 **Local endpoints (after connection):**
@@ -250,9 +316,12 @@ shim/
 │   │   ├── engine.ts
 │   │   ├── middleware-runner.ts
 │   │   └── translator.ts
-│   ├── transport/            # HTTP and WebRTC transports
+│   ├── transport/            # HTTP, WebRTC, and libp2p transports
 │   │   ├── http.ts
-│   │   └── webrtc.ts
+│   │   ├── webrtc.ts
+│   │   └── libp2p.ts         #   Libp2p listen transport (wraps HTTP)
+│   ├── utils/                # Utility modules
+│   │   └── ipfs-api.ts       #   Kubo HTTP RPC client (fetch-based)
 │   └── types/                # TypeScript type definitions
 │       ├── index.ts
 │       ├── lmstudio.ts
