@@ -359,7 +359,11 @@ export class FileBlockStore implements BlockStore {
   }
 
   /**
-   * Parse CAR file and extract all blocks
+   * Parse CAR file and extract all blocks.
+   * 
+   * Handles custom CAR format from ipld-builder.ts:
+   * - Header: varint length + CBOR array of root CIDs
+   * - Blocks: sequence of (varint cid_length, cid_cbor, varint block_length, block_bytes)
    */
   private async loadCAR(): Promise<Map<string, Uint8Array>> {
     if (this.blocks) {
@@ -367,34 +371,57 @@ export class FileBlockStore implements BlockStore {
     }
 
     const { decode: cborDecode } = await import("cborg");
-
     const carBytes = await fs.readFile(this.carPath);
     const blocks = new Map<string, Uint8Array>();
 
     let offset = 0;
 
-    // Read header length varint
-    const headerLength = this.readVarint(carBytes, offset);
-    offset += headerLength.bytesRead;
+    // Helper to read varint
+    const readVarint = (): { value: number; bytesRead: number } => {
+      let value = 0;
+      let shift = 0;
+      let bytesRead = 0;
+      while (offset + bytesRead < carBytes.length) {
+        const byte = carBytes[offset + bytesRead];
+        value |= (byte & 0x7f) << shift;
+        bytesRead++;
+        if ((byte & 0x80) === 0) break;
+        shift += 7;
+      }
+      return { value, bytesRead };
+    };
 
-    // Parse header (CBOR array of root CIDs)
+    // Read header length and header (CBOR array of root CIDs)
+    const headerLength = readVarint();
+    offset += headerLength.bytesRead;
+    
     const header = cborDecode(carBytes.subarray(offset, offset + headerLength.value));
     offset += headerLength.value;
 
-    // Read blocks
+    // Read blocks until end of file
     while (offset < carBytes.length) {
-      // Read CID length varint
-      const cidLength = this.readVarint(carBytes, offset);
+      // Read CID length
+      const cidLength = readVarint();
       offset += cidLength.bytesRead;
 
-      // Parse CID
+      // Parse CID - the CID is stored in JSON-block format with '/' key
       const cidBytes = carBytes.subarray(offset, offset + cidLength.value);
-      const cid = cborDecode(cidBytes);
-      const cidStr = cid.toString();
+      const cidObj = cborDecode(cidBytes);
+      
+      // Handle JSON-block format: { '/': bytes, code, version }
+      let cidStr: string;
+      if (cidObj && typeof cidObj === 'object' && cidObj['/']) {
+        // Reconstruct CID from the bytes
+        const cid = CID.decode(cidObj['/'] as Uint8Array);
+        cidStr = cid.toString();
+      } else {
+        // Already a CID instance or other format
+        cidStr = cidObj.toString?.() || String(cidObj);
+      }
       offset += cidLength.value;
 
-      // Read block length varint
-      const blockLength = this.readVarint(carBytes, offset);
+      // Read block length
+      const blockLength = readVarint();
       offset += blockLength.bytesRead;
 
       // Read block bytes
@@ -405,32 +432,6 @@ export class FileBlockStore implements BlockStore {
 
     this.blocks = blocks;
     return blocks;
-  }
-
-  /**
-   * Read varint from bytes
-   */
-  private readVarint(
-    bytes: Uint8Array,
-    offset: number
-  ): { value: number; bytesRead: number } {
-    let value = 0;
-    let shift = 0;
-    let bytesRead = 0;
-
-    while (offset + bytesRead < bytes.length) {
-      const byte = bytes[offset + bytesRead];
-      value |= (byte & 0x7f) << shift;
-      bytesRead++;
-
-      if ((byte & 0x80) === 0) {
-        break;
-      }
-
-      shift += 7;
-    }
-
-    return { value, bytesRead };
   }
 
   async get(cid: string): Promise<Uint8Array | null> {

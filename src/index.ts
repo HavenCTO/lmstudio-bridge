@@ -608,13 +608,52 @@ async function exportCommand(options: ExportCommandOptions): Promise<void> {
     console.log(`[export] Processing batch ${batchId} (${batchMetadata.conversationCount} conversations)...`);
 
     // Find CAR file for this batch
-    // CAR files are named by batch root CID or batch ID
-    const carPath = path.join(carDir, `batch-${String(batchId).padStart(6, "0")}.car`);
+    // Format: batch directories with timestamp names containing merged.car
+    let carPath: string | null = null;
     
+    // First, check if carDir itself contains merged.car (direct batch directory)
+    const directMergedCarPath = path.join(carDir, "merged.car");
     try {
-      await fs.access(carPath);
+      await fs.access(directMergedCarPath);
+      carPath = directMergedCarPath;
     } catch {
-      console.warn(`[export] CAR file not found: ${carPath}, skipping batch ${batchId}`);
+      // Not a direct batch directory, search for batch subdirectories
+    }
+    
+    // Search for batch directories with merged.car
+    if (!carPath) {
+      try {
+        const batchDirs = await fs.readdir(carDir, { withFileTypes: true });
+        for (const entry of batchDirs) {
+          if (entry.isDirectory() && entry.name.startsWith(`batch-`)) {
+            const mergedCarPath = path.join(carDir, entry.name, "merged.car");
+            try {
+              await fs.access(mergedCarPath);
+              carPath = mergedCarPath;
+              break;
+            } catch {
+              continue;
+            }
+          }
+        }
+      } catch {
+        // carDir doesn't exist or isn't readable
+      }
+    }
+    
+    // Fall back to legacy format
+    if (!carPath) {
+      const legacyCarPath = path.join(carDir, `batch-${String(batchId).padStart(6, "0")}.car`);
+      try {
+        await fs.access(legacyCarPath);
+        carPath = legacyCarPath;
+      } catch {
+        // File not found
+      }
+    }
+    
+    if (!carPath) {
+      console.warn(`[export] CAR file not found for batch ${batchId}, skipping`);
       totalErrors++;
       continue;
     }

@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the IPLD-native architecture of the LLM Shim, which replaces the legacy monolithic JSON blob storage with granular, content-addressed data structures.
+This document describes the IPLD-native architecture of the LLM Shim, which uses granular, content-addressed data structures for efficient storage and retrieval.
 
 ## Key Components
 
@@ -319,23 +319,20 @@ interface UploadMiddlewareOptions {
 }
 ```
 
-## Clean Break Refactor
+## IPLD-Native Architecture
 
-**This is a CLEAN BREAK refactor - NO backwards compatibility with the old monolithic JSON format.**
+### Key Design Principles
 
-### Key Changes
-
-1. **No Legacy Support**: All data going forward uses IPLD structures exclusively
-2. **Deleted Code Paths**: The monolithic JSON upload path has been removed
-3. **IPLD-Only Upload Flow**:
+1. **IPLD-Only Storage**: All data uses IPLD structures exclusively
+2. **IPLD-Only Upload Flow**:
    - Request/Response → IPLD DAG (messages → request/response → root)
    - CAR file creation from IPLD blocks
    - Upload CAR to Filecoin
    - Cache root CID and all component CIDs
 
-### Benefits of Clean Break
+### Benefits
 
-- **Simplified Code**: No dual-path maintenance
+- **Simplified Code**: Single-path maintenance
 - **Consistent Data**: All stored data follows the same IPLD schema
 - **Full Deduplication**: System prompts and messages deduplicated across all conversations
 - **Granular Retrieval**: Individual messages fetchable by CID without downloading full conversation
@@ -362,12 +359,12 @@ ConversationRoot
 └── previousConversation: CID (optional)
 ```
 
-### Migration Notes
+### Data Format
 
-For existing data in the old format:
-- Old CIDs remain valid but are not referenced by new code
-- Historical data can be accessed via the legacy retrieval client
-- New conversations use the IPLD-native format exclusively
+All conversations use the IPLD-native format exclusively:
+- CIDs are content-addressed and verifiable
+- Data is stored in CAR files for efficient retrieval
+- Individual messages are accessible by CID
 
 ## Security Considerations
 

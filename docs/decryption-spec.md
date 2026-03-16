@@ -10,7 +10,7 @@
 
 The LLM Shim encrypts combined request+response payloads using AES-256-GCM, then uploads the encrypted blobs to IPFS/Filecoin. The AES key is wrapped via TACo (Threshold Access Control) threshold encryption, and the resulting encryption metadata is also uploaded to IPFS as a separate file.
 
-This specification covers both the legacy monolithic JSON format and the new IPLD-native DAG format. The IPLD format provides granular addressing, deduplication, and efficient partial retrieval.
+This specification covers the IPLD-native DAG format, which provides granular addressing, deduplication, and efficient partial retrieval.
 
 The shim supports two key management modes:
 

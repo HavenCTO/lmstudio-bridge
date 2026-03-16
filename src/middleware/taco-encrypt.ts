@@ -8,12 +8,16 @@
  */
 
 import * as crypto from 'crypto';
+import { createRequire } from 'module';
 import {
   Middleware,
   RequestPayload,
   ResponsePayload,
   NextFunction,
 } from '../types';
+
+// Create require function for ES modules
+const require = createRequire(import.meta.url);
 
 // ── AES-256-GCM helpers (Node.js native crypto) ────────────────────────────
 
@@ -101,20 +105,34 @@ class TacoKeyWrapper {
     console.log(`[taco-key-wrapper] Initializing TACo client for domain=${this.options.tacoDomain}, ritualId=${this.options.ritualId}`);
     
     try {
-      // Dynamic imports for TACo SDK
-      const tacoModule = await import('@nucypher/taco');
-      const { initialize } = tacoModule;
+      // Initialize nucypher-core WASM module synchronously
+      // This avoids the async WASM loading issues in Node.js
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const nucypherCore = require('@nucypher/nucypher-core');
       
-      // Initialize TACo SDK
-      await initialize();
+      // Load WASM bytes directly and use initSync
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const fs = require('fs');
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const path = require('path');
       
-      // Dynamic import for ethers
-      const ethersModule = await import('ethers');
-      const ethers = (ethersModule as any).ethers || (ethersModule as any).default;
+      const wasmPath = path.join(
+        require.resolve('@nucypher/nucypher-core'),
+        '..',
+        '..',
+        'nucypher_core_wasm_bg.wasm'
+      );
       
-      // Create provider
+      const wasmBytes = fs.readFileSync(wasmPath);
+      nucypherCore.initSync(wasmBytes);
+      
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const ethers = require('ethers');
+      
+      // Create provider for Amoy (L2 chain for DEVNET - where Coordinator contract is deployed)
+      // The Coordinator contract for lynx/DEVNET is on Amoy (80002), not Sepolia (11155111)
       this.provider = new ethers.providers.JsonRpcProvider(
-        'https://ethereum-sepolia-rpc.publicnode.com'
+        'https://rpc-amoy.polygon.technology'
       );
       
       // Set up signer if private key provided
@@ -142,27 +160,28 @@ class TacoKeyWrapper {
     console.log('[taco-key-wrapper] Encrypting AES key with TACo...');
     
     try {
-      const tacoModule = await import('@nucypher/taco');
-      const { encrypt, domains } = tacoModule;
+      // Use require with main entry point - resolves to CJS build
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const tacoCJS = require('@nucypher/taco');
+      const { encrypt, domains, conditions } = tacoCJS;
       
-      // @ts-ignore - dynamic path may not resolve in static analysis
-      const conditionModule = await import('@nucypher/taco/conditions/condition');
-      const { Condition: TacoCondition } = conditionModule;
+      // Use the ERC20Balance predefined condition class
+      const { ERC20Balance } = conditions.predefined.erc20;
       
-      // Build DAO token holder condition
-      const conditionProps = {
+      // Build DAO token holder condition using the predefined class
+      // chain must be a number (chain ID), not a string
+      const chainId = typeof this.options.daoChain === 'string' 
+        ? parseInt(this.options.daoChain, 10) 
+        : this.options.daoChain;
+      
+      const condition = new ERC20Balance({
         contractAddress: this.options.daoContractAddress.toLowerCase(),
-        standardContractType: 'ERC20',
-        chain: this.options.daoChain,
-        method: 'balanceOf',
-        parameters: [':userAddress'],
+        chain: chainId,
         returnValueTest: {
           comparator: '>=',
           value: this.options.minimumBalance || '1',
         },
-      };
-      
-      const condition = new TacoCondition(conditionProps);
+      });
       
       // Encrypt the key using TACo
       const messageKit = await encrypt(

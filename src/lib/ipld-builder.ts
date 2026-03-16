@@ -49,6 +49,12 @@ export interface IPLDBuilder {
     response: OpenAIChatCompletionResponse,
     options?: BuildOptions
   ): Promise<ConversationRoot>;
+  /** Build encrypted conversation DAG (stores encrypted buffer instead of plaintext) */
+  buildEncryptedConversation(
+    request: OpenAIChatCompletionRequest,
+    response: OpenAIChatCompletionResponse,
+    encryptedBuffer: Buffer
+  ): Promise<ConversationRoot>;
   /** Get all blocks created by this builder */
   getBlocks(): Map<string, Uint8Array>;
   /** Clear all cached blocks */
@@ -249,8 +255,9 @@ export function createIPLDBuilder(): IPLDBuilder {
           finish_reason: choice.finish_reason ?? "",
         };
 
-        const { cid } = await createBlock(ipldChoice);
-        choiceCids.push(cid);
+        const { cid: choiceCid, bytes: choiceBytes } = await createBlock(ipldChoice);
+        storeBlock(choiceCid, choiceBytes); // Store the choice block!
+        choiceCids.push(choiceCid);
       }
 
       const ipldResponse: IPLDResponse = {
@@ -359,6 +366,63 @@ export function createIPLDBuilder(): IPLDBuilder {
         responseCid,
         metadataCid,
         totalSize,
+        blockCount: blocks.size,
+      };
+    },
+
+    async buildEncryptedConversation(
+      request: OpenAIChatCompletionRequest,
+      response: OpenAIChatCompletionResponse,
+      encryptedBuffer: Buffer
+    ): Promise<ConversationRoot> {
+      const startTime = Date.now();
+
+      // Create a minimal metadata node indicating encryption
+      const metadata: IPLDMetadataNode = {
+        shim_version: "2.0.0",
+        capture_timestamp: startTime,
+        encryption: {
+          encrypted: true,
+        },
+      };
+
+      const { cid: metadataCid } = await createBlock(metadata);
+      storeBlock(metadataCid, dagJson.encode(metadata));
+
+      // Store the encrypted buffer as a single block
+      // The CID of this block will be the "response" CID
+      const encryptedBytes = new Uint8Array(encryptedBuffer);
+      const encryptedHash = await sha256.digest(encryptedBytes);
+      const encryptedCid = CID.create(1, dagJson.code, encryptedHash);
+      storeBlock(encryptedCid, encryptedBytes);
+
+      // Create a minimal request node (just model info, no message content)
+      const minimalRequest: IPLDRequest = {
+        model: request.model,
+        messages: [], // Empty - content is encrypted
+      };
+      const { cid: requestCid } = await createBlock(minimalRequest);
+      storeBlock(requestCid, dagJson.encode(minimalRequest));
+
+      // Build conversation root pointing to encrypted content
+      const conversation: IPLDConversation = {
+        version: "1.0.0",
+        request: requestCid,
+        response: encryptedCid, // Points to encrypted buffer
+        metadata: metadataCid,
+        timestamp: startTime,
+      };
+
+      const { cid: rootCid, bytes: rootBytes } = await createBlock(conversation);
+      storeBlock(rootCid, rootBytes);
+
+      return {
+        rootCid,
+        messageCids: [], // No individual message CIDs for encrypted content
+        requestCid,
+        responseCid: encryptedCid,
+        metadataCid,
+        totalSize: encryptedBuffer.length,
         blockCount: blocks.size,
       };
     },
