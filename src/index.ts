@@ -12,39 +12,33 @@
  * Optional middleware pipeline (applied in order: gzip → encrypt → upload):
  *   llm-shim --gzip                              # Compress responses
  *   llm-shim --gzip --gzip-level 9               # Max compression
- *   llm-shim --encrypt --wallet-address 0x...     # Lit Protocol encryption
- *   llm-shim --encrypt --lit-network datil-dev    # Lit testnet
+ *   llm-shim --taco-encrypt --dao-contract 0x... # TACo threshold encryption
  *   llm-shim --upload --synapse-private-key 0x... # Filecoin upload via Synapse
- *   llm-shim --gzip --encrypt --upload            # Full pipeline
+ *   llm-shim --gzip --taco-encrypt --upload       # Full pipeline
  */
 
 import { Command } from "commander";
-import { Engine } from "./pipeline/engine";
-import { createHttpTransport } from "./transport/http";
-import { createWebRTCTransport } from "./transport/webrtc";
-import { createLibp2pTransport } from "./transport/libp2p";
+import { Engine } from "./pipeline/engine.js";
+import { createHttpTransport } from "./transport/http.js";
+import { createWebRTCTransport } from "./transport/webrtc.js";
+import { createLibp2pTransport } from "./transport/libp2p.js";
 import {
   IpfsDaemonNotRunningError,
   Libp2pStreamMountingDisabledError,
   P2PProtocolInUseError,
   IpfsApiUrlError,
-} from "./utils/ipfs-api";
-import { loggerMiddleware } from "./middleware/logger";
-import { createGzipMiddleware } from "./middleware/gzip";
-import {
-  createEncryptMiddleware,
-  createLitKeyEncryptor,
-  EncryptMiddlewareHandle,
-} from "./middleware/encrypt";
+} from "./utils/ipfs-api.js";
+import { loggerMiddleware } from "./middleware/logger.js";
+import { createGzipMiddleware } from "./middleware/gzip.js";
 import {
   createTacoEncryptMiddleware,
   TacoEncryptMiddlewareHandle,
-} from "./middleware/taco-encrypt";
+} from "./middleware/taco-encrypt.js";
 import {
   createUploadMiddleware,
   createSynapseUploader,
-} from "./middleware/upload";
-import { createCidRecorder, CidRecorderHandle } from "./middleware/cid-recorder";
+} from "./middleware/upload.js";
+import { createCidRecorder, CidRecorderHandle } from "./middleware/cid-recorder.js";
 
 const program = new Command();
 
@@ -78,22 +72,6 @@ program
     "--gzip-level <level>",
     "Gzip compression level (0-9)",
     "6"
-  )
-  // ── Encrypt middleware (Lit Protocol) ──
-  .option("--encrypt", "Enable Lit Protocol hybrid encryption", false)
-  .option(
-    "--lit-network <network>",
-    "Lit Protocol network (datil-dev, datil-test, datil)",
-    "datil-dev"
-  )
-  .option(
-    "--wallet-address <address>",
-    "Wallet address for encryption access control"
-  )
-  .option(
-    "--lit-chain <chain>",
-    "EVM chain for access-control conditions",
-    "ethereum"
   )
   // ── Encrypt middleware (TACo) ──
   .option("--taco-encrypt", "Enable TACo threshold encryption", false)
@@ -168,11 +146,6 @@ const opts = program.opts<{
   // Gzip
   gzip: boolean;
   gzipLevel: string;
-  // Encrypt (Lit)
-  encrypt: boolean;
-  litNetwork: string;
-  walletAddress?: string;
-  litChain: string;
   // Encrypt (TACo)
   tacoEncrypt: boolean;
   tacoDomain: string;
@@ -256,51 +229,6 @@ async function main(): Promise<void> {
     console.log(`[main] ✓ gzip middleware enabled (level=${level})`);
   }
 
-  // ── Encrypt middleware (Lit Protocol) ──
-
-  // Track Lit key encryptor and encrypt handle for cleanup on shutdown
-  let litKeyEncryptor: ReturnType<typeof createLitKeyEncryptor> | null = null;
-  let encryptHandle: EncryptMiddlewareHandle | null = null;
-
-  if (opts.encrypt) {
-    if (!opts.walletAddress) {
-      console.error(
-        "[main] ✗ --wallet-address is required when --encrypt is enabled"
-      );
-      process.exit(1);
-    }
-
-    // The wallet private key is needed for Lit session signatures when
-    // recovering a persisted key (shared key mode).
-    const litPrivateKey =
-      opts.synapsePrivateKey || process.env.HAVEN_PRIVATE_KEY;
-
-    litKeyEncryptor = createLitKeyEncryptor({
-      network: opts.litNetwork,
-      privateKey: litPrivateKey,
-      chain: opts.litChain,
-    });
-
-    encryptHandle = createEncryptMiddleware({
-      litEncryptKey: litKeyEncryptor.encrypt,
-      litDecryptKey: litPrivateKey ? litKeyEncryptor.decrypt : undefined,
-      walletAddress: opts.walletAddress,
-      chain: opts.litChain,
-      keyMetadataPath: opts.keyMetadata,
-    });
-
-    // Generate AES key and wrap it via Lit once at startup
-    console.log(
-      `[main] initialising Lit Protocol encryption (network=${opts.litNetwork}, chain=${opts.litChain})…`
-    );
-    await encryptHandle.initialize();
-
-    engine.use(encryptHandle.middleware);
-    console.log(
-      `[main] ✓ encrypt middleware enabled (network=${opts.litNetwork}, chain=${opts.litChain})`
-    );
-  }
-
   // ── Encrypt middleware (TACo) ──
 
   let tacoEncryptHandle: TacoEncryptMiddlewareHandle | null = null;
@@ -378,7 +306,7 @@ async function main(): Promise<void> {
     // In shared key mode, the metadataCid is persisted in the key metadata
     // file after the first upload so subsequent sessions skip re-uploading.
     let sessionMetadataCid: string | undefined;
-    if (encryptHandle) {
+    if (tacoEncryptHandle) {
       const fs = await import("fs");
 
       // Check if a previously uploaded metadataCid is already persisted
@@ -399,7 +327,7 @@ async function main(): Promise<void> {
       // Upload if we don't already have the CID
       if (!sessionMetadataCid) {
         const metaJson = JSON.stringify(
-          encryptHandle.getSessionMetadata(),
+          tacoEncryptHandle.getSessionMetadata(),
           null,
           2
         );
@@ -498,19 +426,9 @@ async function main(): Promise<void> {
 
   const shutdown = async () => {
     console.log("\n[main] shutting down…");
-    if (encryptHandle) {
-      encryptHandle.destroy();
-      console.log("[main] encrypt key material zeroed");
-    }
     if (tacoEncryptHandle) {
       tacoEncryptHandle.destroy();
       console.log("[main] taco-encrypt key material zeroed");
-    }
-    if (litKeyEncryptor) {
-      try {
-        await litKeyEncryptor.disconnect();
-        console.log("[main] Lit Protocol disconnected");
-      } catch { /* ignore */ }
     }
     // Close libp2p tunnel (via HTTP RPC, not CLI)
     if (libp2pTransport) {

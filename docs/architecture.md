@@ -372,9 +372,9 @@ For existing data in the old format:
 ## Security Considerations
 
 1. **Content Verification:** All CIDs verified on retrieval
-2. **Key Storage:** Private keys stored encrypted (optional Lit Protocol wrapping)
+2. **Key Storage:** Private keys stored encrypted (optional TACo wrapping)
 3. **Immutable History:** Session chain prevents tampering
-4. **Access Control:** Lit Protocol for encryption key management
+4. **Access Control:** TACo for encryption key management
 
 ## Future Enhancements
 

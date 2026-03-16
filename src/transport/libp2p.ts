@@ -12,8 +12,8 @@
  * engine.handleChatCompletion() which runs the full middleware chain.
  */
 
-import { Engine } from "../pipeline/engine";
-import { createHttpTransport } from "./http";
+import { Engine } from "../pipeline/engine.js";
+import { createHttpTransport } from "./http.js";
 import {
   checkDaemonRunning,
   checkLibp2pStreamMounting,
@@ -21,7 +21,7 @@ import {
   p2pListen,
   p2pClose,
   IpfsDaemonNotRunningError,
-} from "../utils/ipfs-api";
+} from "../utils/ipfs-api.js";
 
 export interface Libp2pTransportOptions {
   /** Port for the local HTTP server that the tunnel forwards to */

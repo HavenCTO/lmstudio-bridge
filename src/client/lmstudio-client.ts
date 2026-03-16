@@ -36,11 +36,20 @@ export class LMStudioClient {
 
   constructor(options?: Partial<LMStudioClientOptions>) {
     this.options = { ...DEFAULTS, ...options };
-    console.log(`[lmstudio-client] targeting ${this.options.baseUrl}`);
+    
+    // Convert HTTP URL to WebSocket URL for LM Studio SDK
+    let wsUrl = this.options.baseUrl;
+    if (wsUrl.startsWith("http://")) {
+      wsUrl = wsUrl.replace("http://", "ws://");
+    } else if (wsUrl.startsWith("https://")) {
+      wsUrl = wsUrl.replace("https://", "wss://");
+    }
+    
+    console.log(`[lmstudio-client] targeting ${wsUrl}`);
 
-    // Initialize SDK client with base URL
+    // Initialize SDK client with WebSocket URL
     this.sdkClient = new SDKClient({
-      baseUrl: this.options.baseUrl,
+      baseUrl: wsUrl,
     });
   }
 

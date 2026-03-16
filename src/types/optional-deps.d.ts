@@ -30,23 +30,6 @@ declare module "better-sqlite3" {
   export = Database;
 }
 
-// Stub for @lit-protocol modules
-declare module "@lit-protocol/lit-client" {
-  export function createLitClient(options: unknown): Promise<unknown>;
-}
-
-declare module "@lit-protocol/auth" {
-  export class AuthManager {
-    createEoaAuthContext(options: unknown): Promise<unknown>;
-  }
-}
-
-declare module "@lit-protocol/networks" {
-  export const nagaDev: unknown;
-  export const nagaTest: unknown;
-  export const naga: unknown;
-}
-
 // Stub for ethers
 declare module "ethers" {
   export class Wallet {

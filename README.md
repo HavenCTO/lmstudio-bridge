@@ -79,7 +79,7 @@ The shim has a modular middleware layer. Each middleware can intercept/modify:
 Built-in middleware:
 - **`logger`** – logs request/response metrics (enabled by default, disable with `--no-logger`)
 - **`gzip`** – gzip-compresses the response payload (`--gzip`)
-- **`encrypt`** – AES-256-GCM + Lit Protocol BLS-IBE hybrid encryption (`--encrypt`)
+- **`encrypt`** – AES-256-GCM + TACo threshold encryption (`--taco-encrypt`)
 - **`upload`** – uploads the (optionally compressed/encrypted) payload to Filecoin via Synapse (`--upload`)
 
 The middleware pipeline is ordered: **gzip → encrypt → upload**. Each step is optional and feeds its output to the next.
@@ -193,11 +193,13 @@ Gzip Middleware:
   --gzip                        Enable gzip compression of responses
   --gzip-level <0-9>            Compression level (default: 6)
 
-Encrypt Middleware (Lit Protocol):
-  --encrypt                     Enable Lit Protocol hybrid encryption
-  --lit-network <network>       Lit network: datil-dev | datil-test | datil (default: datil-dev)
-  --wallet-address <0x...>      Wallet address for owner-only access control (required with --encrypt)
-  --lit-chain <chain>           EVM chain for ACCs (default: ethereum)
+Encrypt Middleware (TACo):
+  --taco-encrypt                Enable TACo threshold encryption
+  --taco-domain <domain>        TACo domain: lynx | ursula | datil-dev | datil-test | datil (default: lynx)
+  --taco-ritual-id <id>         TACo ritual ID for DKG (default: 27)
+  --dao-contract <address>      DAO token contract address for access control (required with --taco-encrypt)
+  --dao-chain <chain>           Blockchain chain for DAO token checks (default: sepolia)
+  --dao-min-balance <balance>   Minimum token balance required for access (default: 1)
 
 Upload Middleware (Synapse / Filecoin):
   --upload                      Enable Synapse upload to Filecoin
@@ -219,11 +221,11 @@ Libp2p Transport (IPFS P2P Tunnel):
 # Compress responses only
 llm-shim --gzip --gzip-level 9
 
-# Encrypt responses with Lit Protocol (testnet)
-llm-shim --encrypt --wallet-address 0xYourWallet
+# Encrypt responses with TACo (testnet)
+llm-shim --taco-encrypt --dao-contract 0xYourContract
 
 # Full pipeline: compress → encrypt → upload to Filecoin
-llm-shim --gzip --encrypt --wallet-address 0xYourWallet \
+llm-shim --gzip --taco-encrypt --dao-contract 0xYourContract \
   --upload --synapse-private-key 0xYourKey
 
 # Upload only (no compression or encryption)
@@ -232,14 +234,15 @@ llm-shim --upload --synapse-private-key 0xYourKey
 
 #### Optional Peer Dependencies
 
-The encrypt and upload middleware use optional SDKs that are dynamically imported at runtime:
+The upload middleware uses optional SDKs that are dynamically imported at runtime:
 
 | Middleware | Optional Dependency | Install |
 |-----------|-------------------|---------|
-| `--encrypt` | `@lit-protocol/lit-node-client` | `npm install @lit-protocol/lit-node-client` |
 | `--upload` | `filecoin-pin` | `npm install filecoin-pin` |
 
 These are **not** required at build time. If not installed, the middleware will fail at runtime with a clear error.
+
+**Note:** The `--taco-encrypt` middleware uses TACo (Threshold Access Control) encryption, which is included in the main dependencies and does not require additional installation.
 
 **HTTP mode endpoints:**
 - `POST /v1/chat/completions` – OpenAI-compatible chat completions

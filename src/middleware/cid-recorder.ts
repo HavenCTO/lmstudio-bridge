@@ -28,13 +28,14 @@
 
 import * as fs from "fs";
 import * as path from "path";
-import { ParquetSchema, ParquetWriter, ParquetReader } from "parquetjs-lite";
+import pkg from "parquetjs-lite";
+const { ParquetSchema, ParquetWriter, ParquetReader } = pkg;
 import {
   Middleware,
   RequestPayload,
   ResponsePayload,
   NextFunction,
-} from "../types";
+} from "../types/index.js";
 
 // ── Schemas ─────────────────────────────────────────────────────────────────
 

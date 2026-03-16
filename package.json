@@ -1,6 +1,7 @@
 {
   "name": "llm-shim",
   "version": "1.0.0",
+  "type": "module",
   "description": "Lightweight shim that accepts OpenAI-compatible LLM requests and proxies to LM Studio with TACo encryption support",
   "main": "dist/index.js",
   "bin": {
@@ -38,7 +39,7 @@
     "ethers": "5.7.2",
     "express": "5.2.1",
     "ipns": "^9.0.0",
-    "multiformats": "^13.0.0",
+    "multiformats": "^13.4.2",
     "parquetjs-lite": "^0.8.7",
     "uuid": "13.0.0"
   },

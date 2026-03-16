@@ -11,10 +11,10 @@ import {
   RequestPayload,
   ResponsePayload,
   Middleware,
-} from "../types";
-import { MiddlewareRunner } from "./middleware-runner";
-import { translateRequest, translateResponse, translateStreamingChunk } from "./translator";
-import { LMStudioClient, LMStudioClientOptions, LMStudioStreamChunk } from "../client/lmstudio-client";
+} from "../types/index.js";
+import { MiddlewareRunner } from "./middleware-runner.js";
+import { translateRequest, translateResponse, translateStreamingChunk } from "./translator.js";
+import { LMStudioClient, LMStudioClientOptions, LMStudioStreamChunk } from "../client/lmstudio-client.js";
 
 export interface EngineOptions {
   lmstudio?: Partial<LMStudioClientOptions>;

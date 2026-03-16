@@ -35,7 +35,7 @@ export interface EncryptionMetadata {
   keyHash: string;
   algorithm: string;
   ivLengthBytes: number;
-  accessControlConditions: unknown[];
+  accessControlConditions: Record<string, unknown>[];
   chain: string;
 }
 
@@ -57,10 +57,10 @@ export interface RetrievalOptions {
 }
 
 export interface RetrievalContext {
-  /** The wallet private key for Lit Protocol decryption */
-  litPrivateKey?: string;
-  /** Lit Protocol network to use */
-  litNetwork?: string;
+  /** The wallet private key for TACo decryption */
+  privateKey?: string;
+  /** TACo domain to use */
+  tacoDomain?: string;
   /** Chain for access control conditions */
   chain?: string;
 }
@@ -98,67 +98,93 @@ async function aesGcmDecrypt(
 }
 
 /**
- * Recover AES key via Lit Protocol.
+ * Recover AES key via TACo Protocol.
  */
-async function recoverKeyViaLit(
+async function recoverKeyViaTaco(
   metadata: EncryptionMetadata,
   privateKey: string,
-  network: string,
+  domain: string,
   chain: string
 ): Promise<Uint8Array> {
-  // Dynamic import for Lit SDK
-  const { createLitClient } = await import("@lit-protocol/lit-client");
-  const { AuthManager } = await import("@lit-protocol/auth");
-  const ethers = await import("ethers");
+  // Dynamic import for TACo SDK
+  const tacoModule = await import("@nucypher/taco");
+  const { decrypt, initialize, domains } = tacoModule;
+  
+  const authModule = await import("@nucypher/taco-auth");
+  const { EIP4361AuthProvider } = authModule;
+  
+  const ethersModule = await import("ethers");
+  const ethers = (ethersModule as any).ethers || (ethersModule as any).default;
 
-  // Map network names
-  const networks = await import("@lit-protocol/networks");
-  const networkMap: Record<string, unknown> = {
-    "datil-dev": networks.nagaDev,
-    datilDev: networks.nagaDev,
-    "datil-test": networks.nagaTest,
-    datilTest: networks.nagaTest,
-    datil: networks.naga,
-  };
-  const networkModule = networkMap[network] || networks.nagaDev;
+  // Initialize TACo SDK
+  await initialize();
 
-  const client = await createLitClient({ network: networkModule }) as {
-    decrypt: (opts: unknown) => Promise<{ decryptedData: Uint8Array }>;
-  };
+  // Create provider
+  const provider = new ethers.providers.JsonRpcProvider(
+    'https://ethereum-sepolia-rpc.publicnode.com'
+  );
 
+  // Create wallet and signer
   const wallet = new ethers.Wallet(
     privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`
   );
+  const signer = wallet.connect(provider);
 
-  const authManager = new AuthManager();
-  const authContext = await authManager.createEoaAuthContext({
-    litClient: client,
-    wallet,
-    resources: [["lit-access-control-condition-decryption", "*"]],
-  });
+  // Create auth provider
+  const authProvider = new EIP4361AuthProvider(provider, signer);
 
-  const unifiedAccessControlConditions = metadata.accessControlConditions.map(
-    (a: unknown) => ({
-      conditionType: "evmBasic" as const,
-      ...(a as Record<string, unknown>),
-    })
+  // Map domain names
+  const domainMap: Record<string, string> = {
+    "lynx": "datil-dev",
+    "ursula": "datil-test",
+    "datil-dev": "datil-dev",
+    "datil-test": "datil-test",
+    "datil": "datil",
+  };
+  const networkName = domainMap[domain] || "datil-dev";
+
+  // Decrypt the key using TACo
+  // Convert encrypted key from base64 string to ThresholdMessageKit
+  const messageKitBytes = Buffer.from(metadata.encryptedKey, 'base64');
+  
+  // @ts-ignore - nucypher-core types
+  const { ThresholdMessageKit } = await import('@nucypher/nucypher-core');
+  const messageKit = ThresholdMessageKit.fromBytes(new Uint8Array(messageKitBytes));
+  
+  // Create ConditionContext for decryption
+  // @ts-ignore - dynamic path may not resolve in static analysis
+  const contextModule = await import('@nucypher/taco/conditions/context');
+  const { ConditionContext } = contextModule;
+  
+  const conditionProps = {
+    contractAddress: (metadata.accessControlConditions[0]?.contractAddress as string)?.toLowerCase() || '',
+    standardContractType: 'ERC20',
+    chain: metadata.chain,
+    method: 'balanceOf',
+    parameters: [':userAddress'],
+    returnValueTest: {
+      comparator: '>=',
+      value: '1',
+    },
+  };
+  
+  const context = new ConditionContext(authProvider, conditionProps);
+  
+  const decryptedBytes = await decrypt(
+    provider,
+    domains.DEVNET,
+    messageKit,
+    context
   );
-
-  const result = await client.decrypt({
-    data: metadata.encryptedKey,
-    unifiedAccessControlConditions,
-    authContext,
-    chain,
-  });
 
   // Verify key hash
   const { createHash } = await import("crypto");
-  const keyHash = createHash("sha256").update(result.decryptedData).digest("hex");
+  const keyHash = createHash("sha256").update(decryptedBytes).digest("hex");
   if (keyHash !== metadata.keyHash) {
     throw new Error("Key hash mismatch - recovered key is invalid");
   }
 
-  return result.decryptedData;
+  return decryptedBytes;
 }
 
 /**
@@ -264,17 +290,17 @@ export async function retrieveConversation(
     if (decryptionKey) {
       // Use provided key
       aesKey = Buffer.from(decryptionKey, "hex");
-    } else if (context.litPrivateKey) {
-      // Recover key via Lit Protocol
-      aesKey = await recoverKeyViaLit(
+    } else if (context.privateKey) {
+      // Recover key via TACo Protocol
+      aesKey = await recoverKeyViaTaco(
         encryptionMetadata,
-        context.litPrivateKey,
-        context.litNetwork ?? "datil-dev",
+        context.privateKey,
+        context.tacoDomain ?? "lynx",
         context.chain ?? "ethereum"
       );
     } else {
       throw new Error(
-        "Decryption key required but not provided. Pass decryptionKey or context.litPrivateKey."
+        "Decryption key required but not provided. Pass decryptionKey or context.privateKey."
       );
     }
 

@@ -38,11 +38,11 @@ import {
   ResponsePayload,
   NextFunction,
   OpenAIChatCompletionRequest,
-} from "../types";
-import { CIDCache } from "../lib/cid-cache";
-import { generateRawCID } from "../lib/cid-utils";
-import { createIPLDBuilder, createCAR, IPLDBuilder } from "../lib/ipld-builder";
-import { createPromptCache } from "../lib/prompt-cache";
+} from "../types/index.js";
+import { CIDCache } from "../lib/cid-cache.js";
+import { generateRawCID } from "../lib/cid-utils.js";
+import { createIPLDBuilder, createCAR, IPLDBuilder } from "../lib/ipld-builder.js";
+import { createPromptCache } from "../lib/prompt-cache.js";
 
 // ── Synapse upload function type ────────────────────────────────────────────
 

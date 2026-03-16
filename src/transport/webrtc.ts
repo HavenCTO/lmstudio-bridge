@@ -23,8 +23,8 @@
  */
 
 import express, { Request, Response } from "express";
-import { Engine } from "../pipeline/engine";
-import { OpenAIChatCompletionRequest } from "../types";
+import { Engine } from "../pipeline/engine.js";
+import { OpenAIChatCompletionRequest } from "../types/index.js";
 import {
   DATACHANNEL_LABEL,
   DATACHANNEL_MAX_MESSAGE_SIZE,
@@ -34,7 +34,7 @@ import {
   createHandshake,
   negotiateVersion,
   generateToken,
-} from "../types/protocol";
+} from "../types/protocol.js";
 
 export interface WebRTCTransportOptions {
   /** Port for the shim's control HTTP server (receives /pair requests) */

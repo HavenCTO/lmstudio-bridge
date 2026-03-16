@@ -2,25 +2,25 @@
 
 **Version:** 2.0 (IPLD-Native)  
 **Status:** Draft  
-**Applies to:** LLM Shim payloads encrypted with `--encrypt --upload`
+**Applies to:** LLM Shim payloads encrypted with `--taco-encrypt --upload`
 
 ---
 
 ## Overview
 
-The LLM Shim encrypts combined request+response payloads using AES-256-GCM, then uploads the encrypted blobs to IPFS/Filecoin. The AES key is wrapped via Lit Protocol's BLS-IBE threshold encryption, and the resulting encryption metadata is also uploaded to IPFS as a separate file.
+The LLM Shim encrypts combined request+response payloads using AES-256-GCM, then uploads the encrypted blobs to IPFS/Filecoin. The AES key is wrapped via TACo (Threshold Access Control) threshold encryption, and the resulting encryption metadata is also uploaded to IPFS as a separate file.
 
 This specification covers both the legacy monolithic JSON format and the new IPLD-native DAG format. The IPLD format provides granular addressing, deduplication, and efficient partial retrieval.
 
 The shim supports two key management modes:
 
 - **Session-scoped key** (default): A fresh AES-256 key is generated each time the shim starts. Each session has its own key and metadata CID.
-- **Shared key** (`--key-metadata <path>`): A single AES-256 key is persisted locally and reused across all sessions. On first run the key is generated and wrapped via Lit, then the metadata JSON is written to the given path. On subsequent runs the key is recovered by decrypting it from the Lit network. All sessions share the same metadata CID.
+- **Shared key** (`--key-metadata <path>`): A single AES-256 key is persisted locally and reused across all sessions. On first run the key is generated and wrapped via TACo, then the metadata JSON is written to the given path. On subsequent runs the key is recovered by decrypting it from the TACo network. All sessions share the same metadata CID.
 
 This document specifies how to retrieve and decrypt any payload given:
 1. The **CID log** (Parquet files produced by the shim)
-2. A **wallet** that satisfies the Lit access-control conditions
-3. Access to the **Lit Protocol network** used during encryption
+2. A **wallet** that satisfies the TACo access-control conditions
+3. Access to the **TACo network** used during encryption
 4. An **IPFS/Filecoin gateway** to fetch content by CID
 
 ---
@@ -67,7 +67,7 @@ Fetch the `metadataCid` from IPFS. The content is a JSON file conforming to:
 ```json
 {
   "version": "hybrid-v1",
-  "encryptedKey": "<base64-encoded Lit BLS-IBE ciphertext>",
+  "encryptedKey": "<base64-encoded TACo ciphertext>",
   "keyHash": "<hex SHA-256 of the raw 32-byte AES key>",
   "algorithm": "AES-GCM",
   "keyLength": 256,
@@ -94,12 +94,12 @@ Fetch the `metadataCid` from IPFS. The content is a JSON file conforming to:
 | Field | Type | Description |
 |---|---|---|
 | `version` | string | Always `"hybrid-v1"`. Future versions may change the layout. |
-| `encryptedKey` | string | The AES-256 key encrypted by Lit Protocol BLS-IBE, base64-encoded. This is the `ciphertext` output from `LitNodeClient.encrypt()`. |
-| `keyHash` | string | SHA-256 hex digest of the raw 32-byte AES key. This is the `dataToEncryptHash` output from `LitNodeClient.encrypt()`. Used by Lit during decryption to verify integrity. |
+| `encryptedKey` | string | The AES-256 key encrypted by TACo threshold encryption, base64-encoded. This is the `ciphertext` output from `TacoClient.encrypt()`. |
+| `keyHash` | string | SHA-256 hex digest of the raw 32-byte AES key. This is the `dataToEncryptHash` output from `TacoClient.encrypt()`. Used by TACo during decryption to verify integrity. |
 | `algorithm` | string | Always `"AES-GCM"`. |
 | `keyLength` | number | Always `256` (bits). |
 | `ivLengthBytes` | number | Always `12`. The first 12 bytes of every encrypted blob are the IV/nonce. |
-| `accessControlConditions` | array | Lit Protocol unified access-control conditions. Defines who can decrypt. The default shim configuration creates an owner-only condition matching a single wallet address. |
+| `accessControlConditions` | array | TACo unified access-control conditions. Defines who can decrypt. The default shim configuration creates an owner-only condition matching a single wallet address. |
 | `chain` | string | The EVM chain used for evaluating access-control conditions (e.g., `"ethereum"`, `"polygon"`). |
 
 ---
@@ -157,18 +157,17 @@ The IV is unique for every payload but the AES key is shared across all payloads
 - Try alternative gateways (the content may be corrupted on one gateway)
 - If all gateways fail verification, the data may have been tampered with
 
-### Step 3: Recover the AES key via Lit Protocol
+### Step 3: Recover the AES key via TACo Protocol
 
-1. Connect to the same Lit network that was used during encryption. The shim defaults to `datil-dev` but this may vary. The network is **not** recorded in the metadata — it must be known out-of-band or configured.
+1. Connect to the same TACo network that was used during encryption. The shim defaults to `lynx` (datil-dev) but this may vary. The network is **not** recorded in the metadata — it must be known out-of-band or configured.
 2. Authenticate with a wallet that satisfies the `accessControlConditions`. For the default owner-only condition, this means the wallet address in the `returnValueTest.value` field.
-3. Call the Lit SDK's `decrypt()` method:
+3. Call the TACo SDK's `decrypt()` method:
 
    **Inputs:**
-   - `ciphertext`: the `encryptedKey` field (base64 string)
-   - `dataToEncryptHash`: the `keyHash` field (hex string)
+   - `data`: the `encryptedKey` field (base64 string)
    - `unifiedAccessControlConditions`: the `accessControlConditions` array, each entry extended with `"conditionType": "evmBasic"`
+   - `authContext`: obtained by signing with the authorized wallet
    - `chain`: the `chain` field
-   - `authSig` or `sessionSigs`: obtained by signing with the authorized wallet
 
    **Output:**
    - `decryptedData`: a `Uint8Array` of exactly **32 bytes** — this is the raw AES-256 key.
@@ -376,10 +375,10 @@ When fetching content, try multiple gateways with verification at each hop:
 |---|---|
 | **Key scope** | Default: one AES-256 key per shim session. With `--key-metadata`: one key shared across all sessions. All payloads sharing a key use unique IVs. |
 | **IV uniqueness** | Each payload gets a cryptographically random 96-bit IV. With a single key, AES-GCM is safe for up to 2³² encryptions. |
-| **Access control** | Controlled by Lit Protocol unified access-control conditions. The default is owner-only (single wallet address). Custom conditions can be configured at the shim level. |
-| **Key recovery** | Requires the authorized wallet to sign a message for the Lit network. The raw AES key never leaves the shim process in plaintext — it is only transmitted to Lit Protocol in encrypted form. |
+| **Access control** | Controlled by TACo unified access-control conditions. The default is owner-only (single wallet address). Custom conditions can be configured at the shim level. |
+| **Key recovery** | Requires the authorized wallet to sign a message for the TACo network. The raw AES key never leaves the shim process in plaintext — it is only transmitted to TACo in encrypted form. |
 | **Forward secrecy** | Not provided. If the AES key is compromised, all payloads encrypted with that key can be decrypted. In session-scoped mode each restart generates a fresh key. In shared key mode all sessions use the same key, so compromise affects the entire history. |
-| **Metadata exposure** | The encryption metadata JSON (access-control conditions, encrypted key) is stored on IPFS and is publicly readable. However, the encrypted key can only be unwrapped by wallets satisfying the ACCs via Lit Protocol. |
+| **Metadata exposure** | The encryption metadata JSON (access-control conditions, encrypted key) is stored on IPFS and is publicly readable. However, the encrypted key can only be unwrapped by wallets satisfying the ACCs via TACo. |
 | **Content verification** | All CIDs are verified during retrieval to detect tampering or corruption. This is essential for decentralized storage where multiple gateways may return different data. |
 
 ---
@@ -400,7 +399,7 @@ When fetching content, try multiple gateways with verification at each hop:
 
 ## 11. Compatibility Notes
 
-- **Lit Protocol SDK:** The shim uses `@lit-protocol/lit-node-client`. Decryptors should use the same major version. The `encrypt`/`decrypt` API surface is stable across `datil-dev`, `datil-test`, and `datil` networks.
+- **TACo SDK:** The shim uses `@nucypher/taco` and `@nucypher/taco-auth`. Decryptors should use the same major version. The `encrypt`/`decrypt` API surface is stable across `lynx` (datil-dev), `ursula` (datil-test), and `datil` networks.
 - **AES-256-GCM:** Available in every major language/runtime: Node.js `crypto`, Python `cryptography`, Go `crypto/aes`, Rust `aes-gcm`, Java `javax.crypto`, browser `SubtleCrypto`.
 - **Parquet:** Readable with DuckDB, pandas, Apache Arrow, parquet-tools, or any Parquet library.
 - **IPFS/Filecoin retrieval:** Any IPFS gateway or Filecoin retrieval client. CIDs are content-addressed and verifiable.
