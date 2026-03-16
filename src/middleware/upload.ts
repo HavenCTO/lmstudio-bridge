@@ -350,11 +350,21 @@ export function createUploadMiddleware(
     
     try {
       console.log(`[upload] batch | [DEBUG] About to await synapseUpload`);
-      const result = await synapseUpload(mergedCarPath, (p) => {
+      
+      // Wrap upload in a longer timeout to handle slow Filecoin operations
+      // Filecoin deals can take several minutes to complete
+      const uploadPromise = synapseUpload(mergedCarPath, (p) => {
         if (p.percentage % 20 === 0) {
           console.log(`[upload] batch | ${p.percentage}%`);
         }
       });
+      
+      // Wait up to 10 minutes for upload to complete (Filecoin can be slow)
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('Upload timeout after 10 minutes')), 600000);
+      });
+      
+      const result = await Promise.race([uploadPromise, timeoutPromise]);
       
       console.log(`[upload] batch | [DEBUG] synapseUpload completed, writing POST-UPLOAD`);
       fsSync.appendFileSync(debugFile, `[${new Date().toISOString()}] POST-UPLOAD - synapseUpload returned!\n`);
