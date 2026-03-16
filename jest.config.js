@@ -1,5 +1,5 @@
 /** @type {import('ts-jest').JestConfigWithTsJest} */
-module.exports = {
+export default {
   preset: 'ts-jest',
   testEnvironment: 'node',
   roots: ['<rootDir>/tests'],
@@ -19,7 +19,7 @@ module.exports = {
   },
   // Transform ESM modules from multiformats and ipld packages
   transformIgnorePatterns: [
-    '/node_modules/(?!(multiformats|@ipld|uint8arrays)/)',
+    '/node_modules/(?!(multiformats|@ipld|uint8arrays|cborg|@multiformats)/)',
   ],
   moduleNameMapper: {
     // Handle path mappings for tests - tests import from '../src/...'

@@ -9,6 +9,11 @@
  *   llm-shim --http --port 9000  # Custom port
  *   llm-shim --lmstudio-url http://localhost:1234
  *
+ * Export commands:
+ *   llm-shim export --registry ./registry.json --batch 0 --output ./export
+ *   llm-shim export --registry ./registry.json --all --output ./export
+ *   llm-shim registry-status --registry ./registry.json
+ *
  * Optional middleware pipeline (applied in order: gzip → encrypt → upload):
  *   llm-shim --gzip                              # Compress responses
  *   llm-shim --gzip --gzip-level 9               # Max compression
@@ -39,6 +44,18 @@ import {
   createSynapseUploader,
 } from "./middleware/upload.js";
 import { createCidRecorder, CidRecorderHandle } from "./middleware/cid-recorder.js";
+import {
+  exportBatchFromCAR,
+  LLaVAExporter,
+  FileBlockStore,
+} from "./export/llava-exporter.js";
+import {
+  createHAMTRegistry,
+  createBatchProcessor,
+  validateRegistry,
+} from "./lib/registry.js";
+import * as fs from "fs/promises";
+import * as path from "path";
 
 const program = new Command();
 
@@ -48,9 +65,9 @@ program
     "Lightweight shim that accepts OpenAI-compatible LLM requests and proxies to LM Studio"
   )
   .version("1.0.0")
-  // ── Transport options ──
-  .option("--http", "Use HTTP transport (default)", false)
-  .option("--webrtc", "Use WebRTC transport", false)
+  // ── Main command (transport options) ──
+  // HTTP is the default transport - no flag needed
+  .option("--webrtc", "Use WebRTC transport instead of HTTP", false)
   .option("--port <number>", "Port for the transport server", "8080")
   .option("--host <address>", "Bind address", "0.0.0.0")
   // ── LM Studio options ──
@@ -110,6 +127,16 @@ program
     "Filecoin RPC WebSocket URL",
     "https://api.calibration.node.glif.io/rpc/v1"
   )
+  .option(
+    "--batch-size <size>",
+    "Batch size for LLaVA export (default: 100)",
+    "100"
+  )
+  .option(
+    "--registry-path <path>",
+    "Path to HAMT registry file",
+    "./registry.json"
+  )
   // ── Shared key ──
   .option(
     "--key-metadata <path>",
@@ -131,11 +158,10 @@ program
     "--ipfs-api-url <url>",
     "Kubo IPFS daemon HTTP RPC API URL",
     "http://127.0.0.1:5001"
-  )
-  .parse(process.argv);
+  );
 
+// ── Parse options before action handlers ──
 const opts = program.opts<{
-  http: boolean;
   webrtc: boolean;
   port: string;
   host: string;
@@ -157,6 +183,8 @@ const opts = program.opts<{
   upload: boolean;
   synapsePrivateKey?: string;
   synapseRpcUrl: string;
+  batchSize: string;
+  registryPath: string;
   // Shared key
   keyMetadata?: string;
   // CID recorder
@@ -168,10 +196,11 @@ const opts = program.opts<{
 }>();
 
 // ── Transport selection with mutual exclusivity ──
-const transportFlags = [opts.http, opts.webrtc, opts.libp2p].filter(Boolean);
+// HTTP is default, --webrtc or --libp2p override
+const transportFlags = [(opts.webrtc ? 1 : 0), (opts.libp2p ? 1 : 0)].filter(Boolean);
 if (transportFlags.length > 1) {
   console.error(
-    "Error: Only one transport mode can be active. Choose --http, --webrtc, or --libp2p."
+    "Error: Only one transport mode can be active. Choose --webrtc or --libp2p (HTTP is default)."
   );
   process.exit(1);
 }
@@ -194,6 +223,66 @@ if (opts.libp2p) {
 } else {
   transport = "http";
 }
+
+// ── Default action - start the shim ──
+program.action(() => {
+  // Start the shim with parsed options
+  main().catch((err) => {
+    if (
+      err instanceof IpfsDaemonNotRunningError ||
+      err instanceof Libp2pStreamMountingDisabledError ||
+      err instanceof P2PProtocolInUseError ||
+      err instanceof IpfsApiUrlError
+    ) {
+      console.error(`\n${err.message}\n`);
+      process.exit(1);
+    }
+    console.error("[main] fatal error:", err);
+    process.exit(1);
+  });
+});
+
+// ── Export subcommand ──
+const exportCmd = program.command("export")
+  .description("Export conversations to LLaVA JSONL format")
+  .requiredOption(
+    "--registry <path>",
+    "Path to HAMT registry file"
+  )
+  .option(
+    "--batch <id>",
+    "Batch ID to export (default: export all batches)"
+  )
+  .requiredOption(
+    "--output <dir>",
+    "Output directory for JSONL files"
+  )
+  .option(
+    "--car-dir <dir>",
+    "Directory containing CAR files (default: ./data)"
+  )
+  .option(
+    "--extract-images",
+    "Extract images from conversations (requires image URLs in content)",
+    false
+  )
+  .action(exportCommand);
+
+// ── Registry status subcommand ──
+program.command("registry-status")
+  .description("Show status of the HAMT registry")
+  .requiredOption(
+    "--registry <path>",
+    "Path to HAMT registry file"
+  )
+  .option(
+    "--verbose",
+    "Show detailed information including all CIDs",
+    false
+  )
+  .action(registryStatusCommand);
+
+program.parse(process.argv);
 
 async function main(): Promise<void> {
   console.log("╔══════════════════════════════════════╗");
@@ -296,10 +385,14 @@ async function main(): Promise<void> {
     engine.use(
       createUploadMiddleware({
         synapseUpload: synapseUploader.upload,
+        registryPath: opts.registryPath,
+        batchSize: parseInt(opts.batchSize, 10),
+        batchBeforeUpload: true,
+        carDir: "./data",
       })
     );
     console.log(
-      `[main] ✓ upload middleware enabled (rpc=${opts.synapseRpcUrl})`
+      `[main] ✓ upload middleware enabled (rpc=${opts.synapseRpcUrl}, batchSize=${opts.batchSize}, registry=${opts.registryPath})`
     );
 
     // Upload encryption session metadata once at startup (if encrypt is active).
@@ -453,18 +546,179 @@ async function main(): Promise<void> {
   process.on("SIGTERM", shutdown);
 }
 
-main().catch((err) => {
-  // Known libp2p errors — print clean message without stack trace
-  if (
-    err instanceof IpfsDaemonNotRunningError ||
-    err instanceof Libp2pStreamMountingDisabledError ||
-    err instanceof P2PProtocolInUseError ||
-    err instanceof IpfsApiUrlError
-  ) {
-    console.error(`\n${err.message}\n`);
-    process.exit(1);
+// ── Export Command Implementation ────────────────────────────────────────────
+
+interface ExportCommandOptions {
+  registry: string;
+  batch?: string;
+  output: string;
+  carDir?: string;
+  extractImages: boolean;
+}
+
+async function exportCommand(options: ExportCommandOptions): Promise<void> {
+  console.log("╔══════════════════════════════════════╗");
+  console.log("║       LLaVA Exporter v1.0.0         ║");
+  console.log("╚══════════════════════════════════════╝");
+  console.log();
+
+  const { registry: registryPath, batch, output: outputDir, carDir = "./data", extractImages } = options;
+
+  // Load registry
+  console.log(`[export] Loading registry from ${registryPath}...`);
+  const registry = createHAMTRegistry();
+  try {
+    await registry.load(registryPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      console.error(`[export] ✗ Registry file not found: ${registryPath}`);
+      process.exit(1);
+    }
+    throw error;
   }
-  // Unknown error — print with stack trace
-  console.error("[main] fatal error:", err);
-  process.exit(1);
-});
+
+  const state = await registry.getState();
+  console.log(`[export] Registry loaded: ${state.totalBatches} batches, ${state.totalConversations} conversations`);
+
+  // Determine which batches to export
+  let batchIds: number[] = [];
+  if (batch !== undefined) {
+    const batchId = parseInt(batch, 10);
+    if (isNaN(batchId) || batchId < 0 || batchId >= state.totalBatches) {
+      console.error(`[export] ✗ Invalid batch ID: ${batch}. Valid range: 0-${state.totalBatches - 1}`);
+      process.exit(1);
+    }
+    batchIds = [batchId];
+  } else {
+    batchIds = state.batches.map((b) => b.batchId);
+  }
+
+  console.log(`[export] Exporting ${batchIds.length} batch(es)...`);
+
+  let totalExported = 0;
+  let totalErrors = 0;
+
+  for (const batchId of batchIds) {
+    const batchMetadata = state.batches[batchId];
+    if (!batchMetadata) {
+      console.warn(`[export] Skipping batch ${batchId}: not found`);
+      continue;
+    }
+
+    console.log(`[export] Processing batch ${batchId} (${batchMetadata.conversationCount} conversations)...`);
+
+    // Find CAR file for this batch
+    // CAR files are named by batch root CID or batch ID
+    const carPath = path.join(carDir, `batch-${String(batchId).padStart(6, "0")}.car`);
+    
+    try {
+      await fs.access(carPath);
+    } catch {
+      console.warn(`[export] CAR file not found: ${carPath}, skipping batch ${batchId}`);
+      totalErrors++;
+      continue;
+    }
+
+    // Export batch
+    const result = await exportBatchFromCAR(
+      carPath,
+      batchMetadata.conversationCids,
+      outputDir,
+      batchId
+    );
+
+    console.log(
+      `[export] ✓ Batch ${batchId}: ${result.conversationCount} conversations exported to ${result.jsonlPath}`
+    );
+
+    if (result.errors.length > 0) {
+      console.warn(`[export]   ${result.errors.length} errors during export`);
+      totalErrors += result.errors.length;
+    }
+
+    totalExported += result.conversationCount;
+  }
+
+  console.log();
+  console.log(`[export] Export complete: ${totalExported} conversations, ${totalErrors} errors`);
+}
+
+// ── Registry Status Command Implementation ──────────────────────────────────
+
+interface RegistryStatusOptions {
+  registry: string;
+  verbose: boolean;
+}
+
+async function registryStatusCommand(options: RegistryStatusOptions): Promise<void> {
+  console.log("╔══════════════════════════════════════╗");
+  console.log("║       Registry Status v1.0.0        ║");
+  console.log("╚══════════════════════════════════════╝");
+  console.log();
+
+  const { registry: registryPath, verbose } = options;
+
+  // Load registry
+  console.log(`[status] Loading registry from ${registryPath}...`);
+  const registry = createHAMTRegistry();
+  try {
+    await registry.load(registryPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      console.error(`[status] ✗ Registry file not found: ${registryPath}`);
+      process.exit(1);
+    }
+    throw error;
+  }
+
+  const state = await registry.getState();
+  const validation = await validateRegistry(registry);
+
+  console.log(`[status] Registry Statistics:`);
+  console.log(`  Version: ${state.version}`);
+  console.log(`  Total Batches: ${state.totalBatches}`);
+  console.log(`  Total Conversations: ${state.totalConversations}`);
+  console.log(`  Last Updated: ${new Date(state.lastUpdated).toISOString()}`);
+  console.log(`  HAMT Root: ${state.hamtRoot || "Not built"}`);
+  console.log();
+
+  console.log(`[status] Validation:`);
+  console.log(`  Status: ${validation.valid ? "✓ Valid" : "✗ Invalid"}`);
+  if (validation.errors.length > 0) {
+    console.log(`  Errors:`);
+    for (const error of validation.errors) {
+      console.log(`    - ${error}`);
+    }
+  }
+  if (validation.warnings.length > 0) {
+    console.log(`  Warnings:`);
+    for (const warning of validation.warnings) {
+      console.log(`    - ${warning}`);
+    }
+  }
+  console.log();
+
+  if (verbose && state.batches.length > 0) {
+    console.log(`[status] Batch Details:`);
+    for (const batch of state.batches) {
+      console.log(`  Batch ${batch.batchId}:`);
+      console.log(`    Conversations: ${batch.conversationCount}`);
+      console.log(`    CAR Size: ${batch.carSize} bytes`);
+      console.log(`    Root CID: ${batch.rootCid || "N/A"}`);
+      console.log(`    Filecoin CID: ${batch.filecoinCid || "Not uploaded"}`);
+      console.log(`    Created: ${new Date(batch.createdAt).toISOString()}`);
+      if (verbose) {
+        console.log(`    CIDs:`);
+        for (const cid of batch.conversationCids.slice(0, 10)) {
+          console.log(`      - ${cid}`);
+        }
+        if (batch.conversationCids.length > 10) {
+          console.log(`      ... and ${batch.conversationCids.length - 10} more`);
+        }
+      }
+    }
+  }
+}
+
+// Note: main() is now called via program.action() for the default command
+// The subcommands (export, registry-status) have their own action handlers
