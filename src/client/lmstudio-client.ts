@@ -37,7 +37,7 @@ export class LMStudioClient {
   constructor(options?: Partial<LMStudioClientOptions>) {
     this.options = { ...DEFAULTS, ...options };
     
-    // Convert HTTP URL to WebSocket URL for LM Studio SDK
+    // LM Studio SDK requires WebSocket URL - convert from HTTP
     let wsUrl = this.options.baseUrl;
     if (wsUrl.startsWith("http://")) {
       wsUrl = wsUrl.replace("http://", "ws://");
@@ -266,14 +266,17 @@ export class LMStudioClient {
 
   /**
    * Convert SDK prediction result to our response format.
+   * SDK stats use different names: promptTokensCount, predictedTokensCount, totalTokensCount
    */
   private convertResultToResponse(result: {
     content?: string;
+    reasoningContent?: string;
     stats?: {
-      inputTokens?: number;
-      outputTokens?: number;
+      promptTokensCount?: number;
+      predictedTokensCount?: number;
+      totalTokensCount?: number;
       tokensPerSecond?: number;
-      timeToFirstTokenSeconds?: number;
+      timeToFirstTokenSec?: number;
     };
     modelInfo?: {
       identifier?: string;
@@ -281,18 +284,19 @@ export class LMStudioClient {
   }): LMStudioChatResponse {
     const output: LMStudioChatResponse["output"] = [];
 
-    // Add message content if present
-    if (result.content) {
+    // Add message content if present (use nonReasoningContent to exclude reasoning)
+    const content = result.content ?? "";
+    if (content) {
       output.push({
         type: "message",
-        content: result.content,
+        content,
       });
     }
 
-    // Extract stats with fallbacks
+    // Extract stats with correct SDK property names
     const stats = result.stats || {};
-    const inputTokens = stats.inputTokens ?? 0;
-    const outputTokens = stats.outputTokens ?? 0;
+    const inputTokens = stats.promptTokensCount ?? 0;
+    const outputTokens = stats.predictedTokensCount ?? 0;
 
     return {
       model_instance_id: result.modelInfo?.identifier ?? "unknown",
@@ -302,7 +306,7 @@ export class LMStudioClient {
         total_output_tokens: outputTokens,
         reasoning_output_tokens: 0,
         tokens_per_second: stats.tokensPerSecond ?? 0,
-        time_to_first_token_seconds: stats.timeToFirstTokenSeconds ?? 0,
+        time_to_first_token_seconds: stats.timeToFirstTokenSec ?? 0,
       },
     };
   }

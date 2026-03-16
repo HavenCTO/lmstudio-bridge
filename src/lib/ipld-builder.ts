@@ -384,37 +384,71 @@ export interface CARFile {
 }
 
 /**
- * Create a CAR file from IPLD blocks
+ * Create a CAR file from IPLD blocks using manual CAR v1 format construction.
+ * 
+ * CAR v1 format:
+ * - Header: CBOR array of root CIDs (with varint length prefix)
+ * - Blocks: sequence of (cid, block) pairs with varint length prefixes
  */
 export async function createCAR(
   rootCid: CID,
   blocks: Map<string, Uint8Array>
 ): Promise<CARFile> {
-  const { CarWriter } = await import("@ipld/car");
+  const { encode: cborEncode } = await import("cborg");
   
-  const { writer, out } = CarWriter.create(rootCid);
+  // Helper to write varint (simple single-byte for small values)
+  const writeVarint = (value: number): Uint8Array => {
+    const result: number[] = [];
+    while (value >= 0x80) {
+      result.push((value & 0x7f) | 0x80);
+      value >>= 7;
+    }
+    result.push(value);
+    return new Uint8Array(result);
+  };
   
-  // Collect all blocks into the CAR
+  // Build header: CBOR array of root CIDs
+  const headerCbor = cborEncode([rootCid]);
+  const headerLength = writeVarint(headerCbor.length);
+  
+  // Build blocks section
+  const blockSections: Uint8Array[] = [];
+  
   for (const [cidStr, bytes] of blocks) {
     const cid = CID.parse(cidStr);
-    await writer.put({ cid, bytes });
+    
+    // Encode CID as CBOR
+    const cidCbor = cborEncode(cid);
+    const cidLength = writeVarint(cidCbor.length);
+    
+    // Encode block bytes length
+    const blockLength = writeVarint(bytes.length);
+    
+    // Combine: cid_length + cid_cbor + block_length + block_bytes
+    const totalBlockLen = cidLength.length + cidCbor.length + blockLength.length + bytes.length;
+    const blockSection = new Uint8Array(totalBlockLen);
+    let offset = 0;
+    blockSection.set(cidLength, offset); offset += cidLength.length;
+    blockSection.set(cidCbor, offset); offset += cidCbor.length;
+    blockSection.set(blockLength, offset); offset += blockLength.length;
+    blockSection.set(bytes, offset);
+    
+    blockSections.push(blockSection);
   }
   
-  await writer.close();
+  // Combine everything: header_length + header_cbor + blocks...
+  const totalLength = headerLength.length + headerCbor.length + 
+    blockSections.reduce((sum, b) => sum + b.length, 0);
   
-  // Read the CAR bytes
-  const chunks: Uint8Array[] = [];
-  for await (const chunk of out) {
-    chunks.push(chunk);
-  }
-  
-  // Concatenate chunks
-  const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
   const carBytes = new Uint8Array(totalLength);
   let offset = 0;
-  for (const chunk of chunks) {
-    carBytes.set(chunk, offset);
-    offset += chunk.length;
+  
+  carBytes.set(headerLength, offset); offset += headerLength.length;
+  carBytes.set(headerCbor, offset); offset += headerCbor.length;
+  
+  for (const blockSection of blockSections) {
+    carBytes.set(blockSection, offset);
+    offset += blockSection.length;
   }
   
   return { bytes: carBytes, rootCid };
