@@ -1,11 +1,12 @@
 /**
- * IPFS/Synapse Retrieval Module
+ * IPFS/Synapse Retrieval Module — V2 Architecture
  *
  * Handles retrieval of CAR files from IPFS gateways and Synapse/Filecoin storage.
- * Supports both public IPFS gateways and private Synapse network retrieval.
+ * Format-agnostic — retrieves raw CAR bytes for extraction by car-extractor.
  */
 
 import { CID } from "multiformats/cid";
+import { CarReader } from "@ipld/car";
 import * as fs from "fs";
 import * as path from "path";
 import { RetrievalResult, SynapseRetrievalOptions } from "../types";
@@ -37,8 +38,7 @@ export async function retrieveFromGateway(
 ): Promise<RetrievalResult> {
   const cidString = typeof cid === "string" ? cid : cid.toString();
   const parsedCid = typeof cid === "string" ? CID.parse(cid) : cid;
-  
-  const gatewayUrl = options.gatewayUrl ?? DEFAULT_GATEWAYS[0];
+
   const timeout = options.timeout ?? 30000;
   const retries = options.retries ?? 3;
 
@@ -46,7 +46,6 @@ export async function retrieveFromGateway(
 
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
-      // Try different gateways on retry
       const currentGateway = options.gatewayUrl ?? DEFAULT_GATEWAYS[attempt % DEFAULT_GATEWAYS.length];
       const url = `${currentGateway}/ipfs/${cidString}`;
 
@@ -75,9 +74,8 @@ export async function retrieveFromGateway(
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
       console.warn(`[retrieval] Attempt ${attempt + 1} failed: ${lastError.message}`);
-      
+
       if (attempt < retries - 1) {
-        // Exponential backoff
         await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
       }
     }
@@ -117,9 +115,6 @@ export async function retrieveMultipleFromGateway(
 
 /**
  * Retrieve data from Synapse/Filecoin network
- * 
- * Note: This requires the filecoin-pin package to be installed.
- * For basic retrieval, IPFS gateway is recommended.
  */
 export async function retrieveFromSynapse(
   cid: string | CID,
@@ -130,16 +125,12 @@ export async function retrieveFromSynapse(
   console.log(`[retrieval] Attempting Synapse retrieval for CID ${cidString}...`);
 
   try {
-    // Dynamic import for optional dependency
-    const { createRetriever } = await import("filecoin-pin/retrieval");
-    
+    const { createRetriever } = await import("filecoin-pin/retrieval" as any);
+
     const rpcUrl = options.rpcUrl ?? "https://api.calibration.node.glif.io/rpc/v1";
     const privateKey = options.privateKey;
 
-    const retriever = createRetriever({
-      rpcUrl,
-      privateKey,
-    });
+    const retriever = (createRetriever as any)({ rpcUrl, privateKey });
 
     console.log(`[retrieval] Downloading from Filecoin network...`);
 
@@ -160,15 +151,14 @@ export async function retrieveFromSynapse(
     const errorMessage = error instanceof Error ? error.message : String(error);
     console.warn(`[retrieval] Synapse retrieval failed: ${errorMessage}`);
     console.log("[retrieval] Falling back to IPFS gateway...");
-    
-    // Fall back to IPFS gateway
+
     return retrieveFromGateway(cid, {
-      ipfsGateway: options.ipfsGateway,
+      gatewayUrl: options.ipfsGateway,
     });
   }
 }
 
-// ── Local CAR File Loading ─────────────────────────────────────────────────-
+// ── Local CAR File Loading ──────────────────────────────────────────────────
 
 /**
  * Load a CAR file from local filesystem
@@ -178,16 +168,17 @@ export async function loadLocalCarFile(filePath: string): Promise<RetrievalResul
     throw new Error(`CAR file not found: ${filePath}`);
   }
 
-  const carBytes = fs.readFileSync(filePath);
-  
-  // Parse CAR to get root CID
-  const { CarHeader } = await import("@ipld/car");
-  const header = CarHeader.load(carBytes);
-  const rootCid = header.roots[0];
+  const carBytes = new Uint8Array(fs.readFileSync(filePath));
 
-  if (!rootCid) {
+  // Parse CAR to get root CID using standard CarReader
+  const reader = await CarReader.fromBytes(carBytes);
+  const roots = await reader.getRoots();
+
+  if (roots.length === 0) {
     throw new Error("CAR file has no root CID");
   }
+
+  const rootCid = roots[0];
 
   return {
     cid: rootCid,
@@ -240,7 +231,6 @@ export async function batchRetrieve(
   const fallbacks = options.fallbackMethods ?? ["gateway"];
   const results = new Map<string, RetrievalResult>();
 
-  // Ensure cache directory exists
   if (options.cacheResults && options.cacheDir) {
     fs.mkdirSync(options.cacheDir, { recursive: true });
   }
@@ -254,22 +244,25 @@ export async function batchRetrieve(
       fn: () => Promise<RetrievalResult>;
     }> = [];
 
-    // Build method chain
     const allMethods = [method, ...fallbacks];
-    
+
     for (const m of allMethods) {
       switch (m) {
         case "gateway":
-          retrievalMethods.push({
-            name: "IPFS Gateway",
-            fn: () => retrieveFromGateway(input.cid, { gatewayUrl: options.ipfsGateway }),
-          });
+          if (input.type === "cid") {
+            retrievalMethods.push({
+              name: "IPFS Gateway",
+              fn: () => retrieveFromGateway(input.cid, { gatewayUrl: options.ipfsGateway }),
+            });
+          }
           break;
         case "synapse":
-          retrievalMethods.push({
-            name: "Synapse",
-            fn: () => retrieveFromSynapse(input.cid, { ipfsGateway: options.ipfsGateway }),
-          });
+          if (input.type === "cid") {
+            retrievalMethods.push({
+              name: "Synapse",
+              fn: () => retrieveFromSynapse(input.cid, { ipfsGateway: options.ipfsGateway }),
+            });
+          }
           break;
         case "local":
           if (input.type === "local") {
@@ -282,21 +275,19 @@ export async function batchRetrieve(
       }
     }
 
-    // Try each method until success
     let success = false;
     for (const { name, fn } of retrievalMethods) {
       try {
         console.log(`[retrieval] Trying ${name}...`);
         const result = await fn();
         results.set(key, result);
-        
-        // Cache result if requested
+
         if (options.cacheResults && options.cacheDir && input.type === "cid") {
           const cachePath = path.join(options.cacheDir, `${result.cid.toString()}.car`);
           fs.writeFileSync(cachePath, result.carBytes);
           console.log(`[retrieval] Cached to: ${cachePath}`);
         }
-        
+
         success = true;
         break;
       } catch (error) {

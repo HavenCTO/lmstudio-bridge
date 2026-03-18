@@ -289,17 +289,13 @@ const sessionCid = await chain.endSession();
 4. **Benchmarking**: Measure actual deduplication rates and retrieval times
 5. **Documentation**: Update API documentation with new interfaces
 
-## Backward Compatibility
+## NO Backward Compatibility NO
 
-The implementation maintains backward compatibility:
-- Existing monolithic JSON uploads continue to work
-- New IPLD format is opt-in via configuration
-- CID recorder handles both formats
-- Gradual migration path for existing data
+We dont need it, we dont have any data to retain, we only have one user, this fresh and new nothing to retain
 
 ## Security Considerations
 
 1. All content verified via CID before processing
-2. Private keys stored encrypted (optional Lit Protocol wrapping)
+2. Private keys stored encrypted (optional TACO )
 3. Immutable session chain prevents tampering
 4. Gateway fallback with verification at each hop

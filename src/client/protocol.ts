@@ -1,6 +1,6 @@
 /**
  * Protocol message types for DataChannel communication.
- * Shared with the LLM shim – must stay in sync.
+ * Shared between the LLM shim (server) and client bridge.
  *
  * Uses schema_version, type discriminator, and handshake negotiation.
  */

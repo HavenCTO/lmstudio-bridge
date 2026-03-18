@@ -1,37 +1,21 @@
 /**
- * Synapse (Filecoin) upload middleware with IPLD-native CID caching.
+ * Synapse (Filecoin) upload middleware — V2 Architecture
  *
- * This is a CLEAN BREAK refactor - no backwards compatibility with the old
- * monolithic JSON format. All data uses IPLD structures.
+ * Hot path stores raw JSON with zero IPLD overhead.
+ * Background flush builds batch archives via archive-builder.ts.
  *
  * Flow:
- * 1. Build IPLD DAG from request/response using IPLDBuilder
- * 2. Check CID cache for deduplication
- * 3. Create CAR file from IPLD blocks
- * 4. Upload CAR to Filecoin via Synapse SDK
- * 5. Cache root CID and component CIDs
+ * 1. onResponse: Store raw conversation JSON in batch buffer (zero crypto)
+ * 2. When batch is full: snapshot buffer, enqueue for background flush
+ * 3. Background: Build IPLD archive → write CAR → upload to Filecoin → update registry
  *
  * Required configuration:
  *   --upload                         Enable Synapse upload
  *   --synapse-private-key <hex>      Wallet private key
  *   --synapse-rpc-url <url>          Filecoin RPC URL
- *
- * After this middleware runs the following metadata keys are set:
- *   - `uploadCid`        – the root conversation CID
- *   - `uploadSize`       – bytes uploaded
- *   - `uploadTimestamp`  – ISO-8601 upload time
- *   - `uploadDealId`     – Filecoin deal ID (when available)
- *   - `deduplicated`     – true if content was found in cache
- *   - `rootCid`          – IPLD root CID
- *   - `requestCid`       – Request node CID
- *   - `responseCid`      – Response node CID
- *   - `messageCids`      – Array of message CIDs
- *   - `systemPromptCids` – Array of deduplicated system prompt CIDs
  */
 
 import * as fs from "fs/promises";
-import * as fsSync from "fs";
-import * as os from "os";
 import * as path from "path";
 import {
   Middleware,
@@ -39,17 +23,13 @@ import {
   ResponsePayload,
   NextFunction,
   OpenAIChatCompletionRequest,
+  OpenAIChatCompletionResponse,
 } from "../types/index.js";
-import { CIDCache } from "../lib/cid-cache.js";
-import { generateRawCID } from "../lib/cid-utils.js";
+import { buildBatchArchive, ArchiveConversation } from "../lib/archive-builder.js";
+import { createDedupCache, computeContentHash, DedupCache } from "../lib/dedup-cache.js";
+import { createRegistry, Registry } from "../lib/registry.js";
+import { FlushQueue, FlushJob } from "../lib/flush-queue.js";
 import { CID } from "multiformats/cid";
-import { createIPLDBuilder, createCAR, IPLDBuilder } from "../lib/ipld-builder.js";
-import { createPromptCache } from "../lib/prompt-cache.js";
-import {
-  createBatchProcessor,
-  BatchProcessor,
-  createHAMTRegistry,
-} from "../lib/registry.js";
 
 // ── Synapse upload function type ────────────────────────────────────────────
 
@@ -105,7 +85,7 @@ export function createSynapseUploader(opts: SynapseUploaderOptions): {
     // @ts-ignore – optional dependency
     const { executeUpload, checkUploadReadiness } = await import("filecoin-pin/core/upload");
 
-    const fileData = fsSync.readFileSync(filePath);
+    const fileData = await fs.readFile(filePath);
     const fileSize = fileData.length;
 
     onProgress?.({ bytesUploaded: 0, totalBytes: fileSize, percentage: 0 });
@@ -129,7 +109,7 @@ export function createSynapseUploader(opts: SynapseUploaderOptions): {
 
     const carBuilder = createUnixfsCarBuilder();
     const carResult = await carBuilder.buildCar(filePath, { bare: true });
-    const carBytes = fsSync.readFileSync(carResult.carPath);
+    const carBytes = await fs.readFile(carResult.carPath);
 
     onProgress?.({ bytesUploaded: 0, totalBytes: carBytes.length, percentage: 20 });
 
@@ -194,80 +174,80 @@ export function createSynapseUploader(opts: SynapseUploaderOptions): {
 
 export interface UploadMiddlewareOptions {
   synapseUpload: SynapseUploadFn;
-  cidCache?: CIDCache;
-  promptCache?: ReturnType<typeof createPromptCache>;
-  /** Enable batch processing for LLaVA export */
-  batchProcessor?: BatchProcessor;
-  /** Path to registry file (used if batchProcessor not provided) */
+  /** Path to registry file */
   registryPath?: string;
-  /** Batch size for automatic batching (default: 100) */
+  /** Batch size for automatic batching (default: 10) */
   batchSize?: number;
-  /** 
-   * When true, accumulate CAR files locally and upload as single batch
-   * When false, upload each conversation individually (default: false for backwards compat)
-   */
-  batchBeforeUpload?: boolean;
   /** Directory for storing pending CAR files (default: ./data) */
   carDir?: string;
+  /** Delete CAR files from disk after successful Filecoin upload (default: true) */
+  cleanupAfterUpload?: boolean;
+  /** Maximum number of batch records to keep in registry (default: 100, 0 = unlimited) */
+  maxRegistryBatches?: number;
 }
 
-// ── Batch-before-upload state ──────────────────────────────────────────────
+// ── Pending Conversation (raw JSON, no IPLD) ────────────────────────────────
 
-interface PendingConversation {
+export interface PendingConversation {
   requestId: string;
-  rootCid: CID;
-  blocks: Map<string, Uint8Array>;
-  carBytes: Uint8Array;
+  timestamp: number;
   request: OpenAIChatCompletionRequest;
-  response: any;
+  response: OpenAIChatCompletionResponse;
+  encrypted: boolean;
+  encryptedBuffer?: Buffer;
 }
 
-interface BatchState {
-  conversations: PendingConversation[];
-  targetSize: number;
+// ── Upload Middleware Handle ────────────────────────────────────────────────
+
+export interface UploadMiddlewareHandle {
+  middleware: Middleware;
+  drainFlushes(timeoutMs?: number): Promise<void>;
+  getFlushStats(): { pending: number; completed: number; failed: number; deadLettered: number; activeJob: boolean };
 }
 
-// ── IPLD Native Upload Middleware ───────────────────────────────────────────
+// ── Helper: extract parameters from request ─────────────────────────────────
+
+function extractParameters(request: OpenAIChatCompletionRequest): Record<string, unknown> | undefined {
+  const params: Record<string, unknown> = {};
+  if (request.temperature !== undefined) params.temperature = request.temperature;
+  if (request.max_tokens !== undefined) params.max_tokens = request.max_tokens;
+  if (request.top_p !== undefined) params.top_p = request.top_p;
+  if (request.frequency_penalty !== undefined) params.frequency_penalty = request.frequency_penalty;
+  if (request.presence_penalty !== undefined) params.presence_penalty = request.presence_penalty;
+  if (request.stream !== undefined) params.stream = request.stream;
+  return Object.keys(params).length > 0 ? params : undefined;
+}
+
+// ── Upload Middleware ───────────────────────────────────────────────────────
 
 export function createUploadMiddleware(
   options: UploadMiddlewareOptions
-): Middleware {
-  const { 
-    synapseUpload, 
-    cidCache, 
-    promptCache, 
-    batchProcessor, 
-    registryPath = "./registry.json", 
-    batchSize,
-    batchBeforeUpload = false,
-    carDir = "./data"
+): UploadMiddlewareHandle {
+  const {
+    synapseUpload,
+    registryPath = "./registry.json",
+    batchSize: targetBatchSize = 10,
+    carDir = "./data",
+    cleanupAfterUpload = true,
+    maxRegistryBatches = 100,
   } = options;
 
-  // Create registry directly for batch-before-upload mode
-  const registry = createHAMTRegistry();
+  // Create v2 registry
+  const registry: Registry = createRegistry();
   const registryLoadPromise = registry.load(registryPath).then(() => {
     console.log(`[upload] Registry loaded from ${registryPath}`);
-  }).catch((err) => {
+  }).catch(() => {
     console.log(`[upload] Starting fresh registry (file not found: ${registryPath})`);
   });
 
-  // Initialize batch processor if enabled (for non-batch-before-upload mode)
-  let processor: BatchProcessor | undefined = batchProcessor;
-  if (!processor && registryPath && !batchBeforeUpload) {
-    processor = createBatchProcessor({
-      batchSize: batchSize ?? 100,
-      registryPath,
-    });
-  }
+  // Dedup cache
+  const dedupCache: DedupCache = createDedupCache();
 
-  // Batch-before-upload state
-  let batchState: BatchState | null = batchBeforeUpload ? {
-    conversations: [],
-    targetSize: batchSize ?? 10,
-  } : null;
+  // Batch buffer (raw conversations, no IPLD)
+  const batchBuffer: PendingConversation[] = [];
 
-  // Flush lock to prevent concurrent flushes
-  let isFlushing = false;
+  // Track last batch CID for provenance chain
+  let lastBatchCid: CID | null = null;
 
   // Ensure car directory exists
   const ensureCarDir = async () => {
@@ -278,179 +258,214 @@ export function createUploadMiddleware(
     }
   };
 
-  // Flush batch - merge CARs and upload as single file
-  async function flushBatch(): Promise<void> {
-    console.log(`[upload] [FLUSH] >>> ENTERING flushBatch function`);
-    
-    if (!batchState || batchState.conversations.length === 0) {
-      console.log(`[upload] [FLUSH] >>> EARLY RETURN - no batch state or empty`);
-      return;
-    }
-    if (isFlushing) {
-      console.log(`[upload] flushBatch skipped - already flushing`);
-      return;
-    }
-    
-    console.log(`[upload] [FLUSH] >>> ACQUIRING flush lock`);
-    isFlushing = true;
-    
-    // Capture current batch and reset immediately to prevent race condition
-    const conversationsToFlush = [...batchState.conversations];
-    batchState.conversations = [];
-    
-    console.log(`[upload] [FLUSH] >>> BATCH CAPTURED with ${conversationsToFlush.length} conversations`);
-    
-    const batchId = Date.now();
-    const batchCarDir = path.join(carDir, `batch-${batchId}`);
-    try {
-      await fs.mkdir(batchCarDir, { recursive: true });
-    } catch {
-      // Ignore errors - directory may already exist
-    }
-    
-    console.log(
-      `[upload] batch | Merging ${conversationsToFlush.length} conversations...`
+  // ── Background flush implementation ─────────────────────────────────────
+
+  async function flushBatch(
+    conversations: PendingConversation[],
+    batchTimestamp: number
+  ): Promise<void> {
+    if (conversations.length === 0) return;
+
+    // 1. Convert to ArchiveConversation format
+    const archiveConversations: ArchiveConversation[] = conversations.map((conv) => ({
+      id: conv.requestId,
+      timestamp: conv.timestamp,
+      model: conv.request.model,
+      request: {
+        messages: conv.request.messages.map((m) => ({
+          role: m.role,
+          content: m.content as string | unknown[],
+          name: m.name,
+        })),
+        parameters: extractParameters(conv.request),
+      },
+      response: {
+        id: (conv.response as any).id ?? "",
+        model: (conv.response as any).model ?? conv.request.model,
+        created: (conv.response as any).created ?? Math.floor(Date.now() / 1000),
+        choices: ((conv.response as any).choices ?? []).map((c: any) => ({
+          index: c.index ?? 0,
+          message: { role: c.message?.role ?? "assistant", content: c.message?.content ?? "" },
+          finish_reason: c.finish_reason ?? "",
+        })),
+        usage: (conv.response as any).usage,
+      },
+      encrypted: conv.encrypted,
+      encryptedPayload: conv.encryptedBuffer ? new Uint8Array(conv.encryptedBuffer) : undefined,
+    }));
+
+    // 2. Build archive (IPLD blocks + CAR)
+    const archive = await buildBatchArchive(
+      archiveConversations,
+      batchTimestamp,
+      "2.0.0",
+      lastBatchCid
     );
-    
-    // Write individual CAR files to batch directory
-    const carFiles: string[] = [];
-    const allBlocks = new Map<string, Uint8Array>();
-    const rootCids: CID[] = [];
-    
-    for (const conv of conversationsToFlush) {
-      const carPath = path.join(batchCarDir, `${conv.requestId}.car`);
-      fsSync.writeFileSync(carPath, conv.carBytes);
-      carFiles.push(carPath);
-      
-      // Collect all blocks for merged CAR
-      for (const [cid, block] of conv.blocks) {
-        allBlocks.set(cid, block);
-      }
-      rootCids.push(conv.rootCid);
-    }
-    
-    // Create merged CAR with all blocks
-    const mergedCar = await createCAR(rootCids[0], allBlocks);
-    const mergedCarPath = path.join(batchCarDir, "merged.car");
-    fsSync.writeFileSync(mergedCarPath, mergedCar.bytes);
-    
+
+    // 3. Write CAR to disk (crash recovery)
+    const batchCarDir = path.join(carDir, `batch-${batchTimestamp}`);
+    await fs.mkdir(batchCarDir, { recursive: true });
+    const carPath = path.join(batchCarDir, "merged.car");
+    await fs.writeFile(carPath, archive.carBytes);
+
     console.log(
-      `[upload] batch | Merged CAR: ${mergedCar.bytes.length} bytes, ${allBlocks.size} blocks`
+      `[upload] batch | Merged CAR: ${archive.carBytes.length} bytes, ${archive.blockCount} blocks`
     );
-    
-    // Upload merged CAR
+
+    // 4. Upload to Filecoin
     console.log(`[upload] batch | Uploading to Filecoin...`);
-    
-    console.log(`[upload] batch | [PRE-UPLOAD] About to call synapseUpload...`);
-    
-    // Write debug file to trace execution - use sync write to ensure it happens
-    const debugFile = path.join(carDir, `debug-${Date.now()}.log`);
-    fsSync.writeFileSync(debugFile, `[${new Date().toISOString()}] PRE-UPLOAD\n`);
-    console.log(`[upload] batch | [DEBUG] Wrote debug file: ${debugFile}`);
-    
-    try {
-      console.log(`[upload] batch | [DEBUG] About to await synapseUpload`);
-      
-      // Wrap upload in a longer timeout to handle slow Filecoin operations
-      // Filecoin deals can take several minutes to complete
-      const uploadPromise = synapseUpload(mergedCarPath, (p) => {
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("Upload timeout after 10 minutes")), 600000);
+    });
+
+    const result = await Promise.race([
+      synapseUpload(carPath, (p) => {
         if (p.percentage % 20 === 0) {
           console.log(`[upload] batch | ${p.percentage}%`);
         }
-      });
-      
-      // Wait up to 10 minutes for upload to complete (Filecoin can be slow)
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        setTimeout(() => reject(new Error('Upload timeout after 10 minutes')), 600000);
-      });
-      
-      const result = await Promise.race([uploadPromise, timeoutPromise]);
-      
-      console.log(`[upload] batch | [DEBUG] synapseUpload completed, writing POST-UPLOAD`);
-      fsSync.appendFileSync(debugFile, `[${new Date().toISOString()}] POST-UPLOAD - synapseUpload returned!\n`);
-      console.log(`[upload] batch | [POST-UPLOAD] >>> synapseUpload returned!`);
-      console.log(`[upload] batch | ✓ Uploaded ${result.cid} (${result.size} bytes)`);
-      console.log(`[upload] batch | [STEP 1] >>> STARTING registry update process`);
-      console.log(`[upload] batch | [STEP 1] >>> registryPath = ${registryPath}`);
-      
-      // Wait for registry to load FIRST, before any other operations
-      console.log(`[upload] batch | [STEP 2] Waiting for registry load...`);
-      
-      try {
-        console.log(`[upload] batch | [STEP 2] >>> ABOUT TO await registryLoadPromise`);
-        await registryLoadPromise;
-        console.log(`[upload] batch | [STEP 3] >>> Registry loaded successfully`);
-      } catch (loadErr) {
-        console.log(`[upload] batch | [STEP 3] Registry load error (expected if file doesn't exist): ${loadErr}`);
-      }
-      
-      console.log(`[upload] batch | [STEP 4] >>> Registry loaded, updating...`);
-      
-      // Add all CIDs to the registry
-      const cidStrings = conversationsToFlush.map((c: PendingConversation) => c.rootCid.toString());
-      console.log(`[upload] batch | [STEP 5] >>> Adding ${cidStrings.length} CIDs to registry...`);
-      
-      for (const conv of conversationsToFlush) {
-        console.log(`[upload] batch | [STEP 5] >>> About to add CID: ${conv.rootCid.toString()}`);
-        await registry.addConversation(conv.rootCid);
-        console.log(`[upload] batch | [STEP 5] >>> Added CID: ${conv.rootCid.toString()}`);
-      }
-      
-      // Create batch metadata
-      console.log(`[upload] batch | [STEP 6] >>> Creating batch metadata...`);
-      const metadata = await registry.createBatch(cidStrings);
-      metadata.rootCid = result.cid;
-      metadata.carSize = result.size;
-      metadata.filecoinCid = result.cid;
-      console.log(`[upload] batch | [STEP 6] >>> Created batch ${metadata.batchId} with ${metadata.conversationCount} conversations`);
-      
-      console.log(`[upload] batch | [STEP 7] >>> Persisting registry to ${registryPath}...`);
-      await registry.persist(registryPath);
-      console.log(`[upload] batch | [STEP 7] >>> Registry persisted to disk`);
-      
-      // Verify persistence by reading the file
-      const savedState = await registry.getState();
-      console.log(
-        `[upload] batch | [STEP 8] ✓ Registry updated with batch ${metadata.batchId} (${metadata.conversationCount} conversations)`
-      );
-      console.log(
-        `[upload] batch | [STEP 8] Registry state: ${savedState.totalBatches} batches, ${savedState.totalConversations} conversations`
-      );
-      
-      // Double-check file exists
-      const fileExists = await fs.access(registryPath).then(() => true).catch(() => false);
-      if (fileExists) {
-        console.log(`[upload] batch | [STEP 9] ✓ Registry file confirmed to exist at ${registryPath}`);
-        const fileContent = await fs.readFile(registryPath, 'utf-8');
-        console.log(`[upload] batch | [STEP 9] Registry file content: ${fileContent}`);
-      } else {
-        console.error(`[upload] batch | [STEP 9] ⚠️ Registry file NOT found at ${registryPath}`);
-      }
-      
-      await fs.appendFile(debugFile, `[${new Date().toISOString()}] FINAL - Flush complete, lock released\n`);
-      await fs.appendFile(debugFile, `[${new Date().toISOString()}] EXITING flushBatch function\n`);
-      console.log(`[upload] batch | [FINAL] >>> Flush complete, lock released`);
-      console.log(`[upload] [FLUSH] >>> EXITING flushBatch function`);
-    } catch (err) {
-      await fs.appendFile(debugFile, `[${new Date().toISOString()}] ERROR - Flush failed: ${err}\n`);
-      console.error(`[upload] batch | [ERROR] >>> Flush failed: ${err}`);
-      console.error(`[upload] batch | [ERROR] >>> Stack: ${(err as Error).stack}`);
-    } finally {
-      isFlushing = false;
-      await fs.appendFile(debugFile, `[${new Date().toISOString()}] FINALLY - Lock released\n`);
+      }),
+      timeoutPromise,
+    ]);
+
+    console.log(`[upload] batch | ✓ Uploaded ${result.cid} (${result.size} bytes)`);
+
+    // 5. Wait for registry to load before updating
+    try {
+      await registryLoadPromise;
+    } catch {
+      // Expected if file doesn't exist — fresh registry
     }
-    
-    return;
+
+    // 6. Update registry
+    await registry.addBatch({
+      batchId: batchTimestamp,
+      rootCid: archive.rootCid.toString(),
+      filecoinCid: result.cid,
+      conversationCids: [...archive.conversationCids.values()].map((c) => c.toString()),
+      carSize: archive.carBytes.length,
+      conversationCount: archiveConversations.length,
+      createdAt: Date.now(),
+      previousBatchCid: lastBatchCid?.toString() ?? null,
+    });
+    await registry.persist(registryPath);
+
+    const savedState = await registry.getState();
+    console.log(
+      `[upload] batch | ✓ Registry updated: ${savedState.totalBatches} batches, ${savedState.totalConversations} conversations`
+    );
+
+    // 7. Update chain pointer
+    lastBatchCid = archive.rootCid;
+
+    // 8. Update dedup cache
+    for (const conv of archiveConversations) {
+      const hash = await computeContentHash(conv.request, conv.response);
+      dedupCache.add(hash);
+    }
+
+    // 9. Cleanup: delete CAR files from disk after successful upload
+    if (cleanupAfterUpload) {
+      try {
+        await fs.rm(batchCarDir, { recursive: true, force: true });
+        console.log(`[upload] batch | ✓ Cleaned up ${batchCarDir}`);
+      } catch {
+        console.warn(`[upload] batch | Failed to cleanup ${batchCarDir}`);
+      }
+    }
+
+    // 10. Prune old registry entries to bound disk usage
+    if (maxRegistryBatches > 0) {
+      const pruned = await registry.prune(maxRegistryBatches);
+      if (pruned.length > 0) {
+        await registry.persist(registryPath);
+        console.log(
+          `[upload] batch | ✓ Pruned ${pruned.length} old batch records from registry`
+        );
+
+        // Also clean up CAR directories for pruned batches (if they still exist)
+        if (cleanupAfterUpload) {
+          for (const record of pruned) {
+            const oldBatchDir = path.join(carDir, `batch-${record.batchId}`);
+            try {
+              await fs.rm(oldBatchDir, { recursive: true, force: true });
+            } catch {
+              // Already cleaned up or doesn't exist — fine
+            }
+          }
+        }
+      }
+    }
   }
 
-  return {
+  // ── Flush queue ─────────────────────────────────────────────────────────
+
+  const flushQueueInstance = new FlushQueue(
+    async (job: FlushJob) => {
+      await flushBatch(
+        job.conversations as unknown as PendingConversation[],
+        job.batchTimestamp
+      );
+    },
+    {
+      maxRetries: 3,
+      retryDelayMs: 5000,
+      maxRetryDelayMs: 60000,
+      maxQueueDepth: 50,
+    }
+  );
+
+  flushQueueInstance.onComplete((job, error) => {
+    if (error) {
+      console.error(
+        `[upload] background flush failed permanently: batch ${job.batchTimestamp}, ` +
+        `${job.conversations.length} conversations — CAR files preserved on disk for recovery`
+      );
+    }
+  });
+
+  // ── Crash recovery ────────────────────────────────────────────────────
+
+  async function recoverPendingBatches(): Promise<void> {
+    try {
+      const entries = await fs.readdir(carDir, { withFileTypes: true });
+      const registryState = await registry.getState();
+      const knownBatchIds = new Set(
+        registryState.batches.map((b) => b.batchId)
+      );
+
+      for (const entry of entries) {
+        if (!entry.isDirectory() || !entry.name.startsWith("batch-")) continue;
+        const timestamp = parseInt(entry.name.replace("batch-", ""), 10);
+        if (knownBatchIds.has(timestamp)) continue;
+
+        const mergedCarPath = path.join(carDir, entry.name, "merged.car");
+        try {
+          await fs.access(mergedCarPath);
+          console.log(`[upload] recovering unflushed batch: ${entry.name}`);
+          flushQueueInstance.enqueueRecovery(mergedCarPath, timestamp);
+        } catch {
+          // No merged.car — incomplete batch, skip
+        }
+      }
+    } catch {
+      // carDir doesn't exist yet — nothing to recover
+    }
+  }
+
+  // Kick off recovery after registry loads (non-blocking)
+  registryLoadPromise.then(() => recoverPendingBatches()).catch(() => {});
+
+  // ── Middleware handlers ─────────────────────────────────────────────────
+
+  const middleware: Middleware = {
     name: "upload",
 
     async onRequest(
       payload: RequestPayload,
       next: NextFunction
     ): Promise<void> {
-      // Capture the request for IPLD building
+      // Capture the request for later use
       if (!payload.context.metadata.capturedRequest) {
         payload.context.metadata.capturedRequest = payload.openaiRequest;
       }
@@ -469,12 +484,10 @@ export function createUploadMiddleware(
       const isEncrypted = !!encryptedBuffer;
 
       // FAIL-CLOSED: Check if taco-encrypt middleware was registered
-      // If encryption middleware is in the pipeline but no encrypted buffer exists, FAIL
       const pipeline = (payload.context as any).pipeline;
       const hasTacoEncrypt = pipeline?.middlewares?.some((m: any) => m.name === 'taco-encrypt');
-      
+
       if (hasTacoEncrypt && !isEncrypted) {
-        // FAIL CLOSED - do not upload unencrypted data when encryption is expected
         throw new Error(
           `[upload] SECURITY: taco-encrypt middleware is registered but no encryptedBuffer found. ` +
           `Refusing to upload plaintext data. RequestId: ${payload.context.requestId}`
@@ -487,208 +500,45 @@ export function createUploadMiddleware(
         );
       }
 
-      // Create IPLD builder
-      const builder = createIPLDBuilder();
+      // Store raw conversation for background processing — ZERO IPLD work
+      const pending: PendingConversation = {
+        requestId: payload.context.requestId,
+        timestamp: Date.now(),
+        request,
+        response,
+        encrypted: isEncrypted,
+        encryptedBuffer,
+      };
 
-      // Build IPLD DAG - use encrypted content if available
-      const conversationRoot = isEncrypted
-        ? await builder.buildEncryptedConversation(request, response, encryptedBuffer!)
-        : await builder.buildConversation(request, response);
+      batchBuffer.push(pending);
 
-      const rootCidString = conversationRoot.rootCid.toString();
+      console.log(
+        `[upload] ${payload.context.requestId} | Added to batch (size: ${batchBuffer.length}/${targetBatchSize})`
+      );
 
-      // Check CID cache for deduplication
-      if (cidCache) {
-        const exists = await cidCache.has(rootCidString);
-        if (exists) {
-          const cachedEntry = await cidCache.get(rootCidString);
-          
-          payload.context.metadata.uploadCid = rootCidString;
-          payload.context.metadata.rootCid = rootCidString;
-          payload.context.metadata.requestCid = conversationRoot.requestCid.toString();
-          payload.context.metadata.responseCid = conversationRoot.responseCid.toString();
-          payload.context.metadata.messageCids = conversationRoot.messageCids.map(c => c.toString());
-          payload.context.metadata.uploadSize = cachedEntry?.size ?? conversationRoot.totalSize;
-          payload.context.metadata.uploadTimestamp = new Date(cachedEntry?.uploadedAt ?? Date.now()).toISOString();
-          payload.context.metadata.deduplicated = true;
-          
-          if (promptCache && request.messages.length > 0 && request.messages[0].role === "system") {
-            const systemContent = typeof request.messages[0].content === "string"
-              ? request.messages[0].content
-              : JSON.stringify(request.messages[0].content);
-            const systemCid = await promptCache.get(systemContent);
-            if (systemCid) {
-              payload.context.metadata.systemPromptCids = [systemCid.toString()];
-            }
-          }
-
-          console.log(
-            `[upload] ${payload.context.requestId} | ⟲ DEDUPLICATED root=${rootCidString} (${conversationRoot.blockCount} blocks) - skipping upload`
-          );
-
-          await next();
-          return;
-        }
-      }
-
-      // Create CAR file
-      const blocks = builder.getBlocks();
-      const car = await createCAR(conversationRoot.rootCid, blocks);
-
-      if (batchBeforeUpload && batchState) {
-        // ============ BATCH-BEFORE-UPLOAD MODE ============
-        // Store CAR file locally, upload when batch is full
-        
-        const pending: PendingConversation = {
-          requestId: payload.context.requestId,
-          rootCid: conversationRoot.rootCid,
-          blocks,
-          carBytes: car.bytes,
-          request,
-          response,
-        };
-        
-        batchState.conversations.push(pending);
-        
+      // Check batch threshold — snapshot and enqueue (non-blocking)
+      if (batchBuffer.length >= targetBatchSize) {
+        const snapshot = batchBuffer.splice(0);
         console.log(
-          `[upload] ${payload.context.requestId} | Added to batch (size: ${batchState.conversations.length}/${batchState.targetSize})`
+          `[upload] ${payload.context.requestId} | Batch full (${snapshot.length}/${targetBatchSize}), queued for background flush`
         );
-        
-        // Check if batch is full
-        if (batchState.conversations.length >= batchState.targetSize) {
-          console.log(`[upload] ${payload.context.requestId} | Triggering batch flush...`);
-          try {
-            await flushBatch();
-            console.log(`[upload] ${payload.context.requestId} | Batch flush completed successfully`);
-          } catch (flushErr) {
-            console.error(`[upload] ${payload.context.requestId} | ERROR during flush: ${flushErr}`);
-          }
-        }
-        
-        // Set pending metadata
-        payload.context.metadata.uploadCid = rootCidString;
-        payload.context.metadata.rootCid = rootCidString;
-        payload.context.metadata.requestCid = conversationRoot.requestCid.toString();
-        payload.context.metadata.responseCid = conversationRoot.responseCid.toString();
-        payload.context.metadata.messageCids = conversationRoot.messageCids.map(c => c.toString());
-        payload.context.metadata.deduplicated = false;
-        payload.context.metadata.batchPending = true;
-        
-      } else {
-        // ============ INDIVIDUAL UPLOAD MODE (original behavior) ============
-        
-        // Write CAR to temp file
-        const tmpDir = os.tmpdir();
-        const tmpFile = path.join(
-          tmpDir,
-          `llm-shim-${payload.context.requestId}.car`
-        );
-        fsSync.writeFileSync(tmpFile, car.bytes);
-
-        try {
-          console.log(
-            `[upload] ${payload.context.requestId} | IPLD DAG with ${conversationRoot.blockCount} blocks, ${car.bytes.length} bytes`
-          );
-          console.log(
-            `[upload] ${payload.context.requestId} | root=${rootCidString}`
-          );
-
-          const result = await synapseUpload(tmpFile, (p) => {
-            if (p.percentage % 20 === 0) {
-              console.log(
-                `[upload] ${payload.context.requestId} | ${p.percentage}%`
-              );
-            }
-          });
-
-          // Set metadata
-          payload.context.metadata.uploadCid = result.cid;
-          payload.context.metadata.rootCid = rootCidString;
-          payload.context.metadata.requestCid = conversationRoot.requestCid.toString();
-          payload.context.metadata.responseCid = conversationRoot.responseCid.toString();
-          payload.context.metadata.messageCids = conversationRoot.messageCids.map(c => c.toString());
-          payload.context.metadata.uploadSize = result.size;
-          payload.context.metadata.uploadTimestamp = result.uploadedAt;
-          payload.context.metadata.deduplicated = false;
-
-          if (result.dealId) {
-            payload.context.metadata.uploadDealId = result.dealId;
-          }
-
-          if (result.cid !== rootCidString) {
-            console.warn(
-              `[upload] ${payload.context.requestId} | ⚠️ CID mismatch! local=${rootCidString}, server=${result.cid}`
-            );
-          }
-
-          console.log(
-            `[upload] ${payload.context.requestId} | ✓ root=${result.cid} (${result.size} bytes)`
-          );
-
-          // Add to CID cache
-          if (cidCache) {
-            await cidCache.add(rootCidString, {
-              size: result.size,
-              uploadedAt: Date.now(),
-              dealStatus: "pending",
-              mimeType: "application/vnd.ipld.car",
-            });
-
-            const componentEntries = [
-              { cid: conversationRoot.requestCid.toString(), size: 0 },
-              { cid: conversationRoot.responseCid.toString(), size: 0 },
-              { cid: conversationRoot.metadataCid.toString(), size: 0 },
-              ...conversationRoot.messageCids.map(c => ({ cid: c.toString(), size: 0 })),
-            ];
-
-            await cidCache.addBatch(componentEntries.map(e => ({
-              cid: e.cid,
-              size: e.size,
-              uploadedAt: Date.now(),
-              dealStatus: "pending",
-              mimeType: "application/vnd.ipld.dag-json",
-            })));
-          }
-
-          // Track system prompt deduplication
-          if (promptCache && request.messages.length > 0 && request.messages[0].role === "system") {
-            const systemContent = typeof request.messages[0].content === "string"
-              ? request.messages[0].content
-              : JSON.stringify(request.messages[0].content);
-            const existingCid = await promptCache.get(systemContent);
-            if (existingCid) {
-              payload.context.metadata.systemPromptCids = [existingCid.toString()];
-            } else {
-              const systemMessageCid = conversationRoot.messageCids[0];
-              if (systemMessageCid) {
-                await promptCache.set(systemContent, systemMessageCid);
-                payload.context.metadata.systemPromptCids = [systemMessageCid.toString()];
-              }
-            }
-          }
-
-          // Add to batch processor if enabled
-          if (processor) {
-            const rootCidObj = CID.parse(rootCidString);
-            const batchMetadata = await processor.addConversation(rootCidObj);
-            
-            if (batchMetadata) {
-              payload.context.metadata.batchId = batchMetadata.batchId;
-              payload.context.metadata.batchRootCid = batchMetadata.rootCid;
-              payload.context.metadata.batchSize = batchMetadata.conversationCount;
-              
-              console.log(
-                `[upload] ${payload.context.requestId} | ✓ Batch ${batchMetadata.batchId} created with ${batchMetadata.conversationCount} conversations`
-              );
-            }
-          }
-
-        } finally {
-          try { fsSync.unlinkSync(tmpFile); } catch { /* ignore */ }
-        }
+        flushQueueInstance.enqueue(snapshot as any, Date.now());
       }
+
+      // Set minimal metadata — response returns immediately
+      payload.context.metadata.batchPending = true;
+      payload.context.metadata.requestId = pending.requestId;
 
       await next();
+      // ← Client gets response immediately. Zero IPLD work on hot path.
     },
+  };
+
+  // ── Return handle ───────────────────────────────────────────────────────
+
+  return {
+    middleware,
+    drainFlushes: (timeoutMs?: number) => flushQueueInstance.drain(timeoutMs),
+    getFlushStats: () => flushQueueInstance.getStats(),
   };
 }

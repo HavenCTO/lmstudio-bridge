@@ -1,16 +1,23 @@
 /**
- * LM Studio Bridge Data Recovery Module
+ * LM Studio Bridge Data Recovery Module — V2 Architecture
  *
  * Main entry point for programmatic use of the data recovery tools.
+ * Only supports v2 archival format (flat dag-cbor blocks in standard CARv1).
  *
  * @example
  * ```typescript
- * import { recoverConversation, listAvailableCids } from './data-recovery';
+ * import { recoverBatch, listBatchesFromRegistry } from './data-recovery';
  *
- * // Recover a single conversation
- * const result = await recoverConversation(
+ * // Recover a batch from IPFS
+ * const result = await recoverBatch(
  *   { type: 'cid', cid: 'bafy...abc' },
  *   { outputDir: './recovered' }
+ * );
+ *
+ * // Or extract from a local CAR file
+ * const result = await recoverBatch(
+ *   { type: 'local', filePath: './data/batch-123/merged.car' },
+ *   { outputDir: './recovered', splitConversations: true }
  * );
  * ```
  */
@@ -27,17 +34,15 @@ export {
 } from "./lib/retriever";
 
 export {
-  // CAR extraction
+  // CAR extraction (v2 batch format)
   parseCarFile,
-  extractConversation,
-  extractRequest,
-  extractResponse,
-  extractMetadata,
-  extractMessage,
-  extractSystemPrompt,
+  extractBatch,
+  extractConversationByCid,
   exportConversation,
-  saveConversationToFile,
-  batchExtractConversations,
+  exportBatch,
+  saveBatchToFile,
+  saveConversationsToDir,
+  decodeBlock,
 } from "./lib/car-extractor";
 
 export {
@@ -53,36 +58,56 @@ export {
 
 export {
   // Recovery orchestration
-  recoverConversation,
-  recoverConversations,
-  recoverEncryptedPayloads,
-  listAvailableCids,
+  recoverBatch,
+  recoverBatches,
+  listBatchesFromRegistry,
 } from "./lib/recovery";
 
 // Type exports
 export type {
-  // Core types
+  // Core conversation types (v2)
   RecoveredMessage,
   RecoveredRequest,
   RecoveredResponse,
-  RecoveredMetadata,
+  RecoveredChoice,
   RecoveredConversation,
-  
+  RecoveredBatchRoot,
+
   // CAR types
   CarBlock,
   CarFileData,
-  
+  BatchExtractionResult,
+
   // Encryption types
   EncryptionMetadata,
   AccessControlCondition,
   DecryptionResult,
-  
+
   // Retrieval types
   RetrievalResult,
   SynapseRetrievalOptions,
-  
+
   // Recovery options
   RecoveryOptions,
-  RecoveryPipelineOptions,
-  BatchDecryptionResult,
 } from "./types";
+
+export type {
+  RecoveryPipelineResult,
+  RecoveryPipelineOptions,
+} from "./lib/recovery";
+
+export type {
+  GatewayRetrievalOptions,
+  BatchRetrievalOptions,
+} from "./lib/retriever";
+
+export type {
+  ExportOptions,
+} from "./lib/car-extractor";
+
+export type {
+  TacoDecryptionOptions,
+  EncryptedKeyData,
+  HybridEncryptedData,
+  BatchDecryptionResult,
+} from "./lib/decryptor";

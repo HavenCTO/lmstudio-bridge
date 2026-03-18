@@ -9,7 +9,7 @@
  */
 
 import * as http from "http";
-import { SIGNALING_TIMEOUT_MS } from "./protocol";
+import { SIGNALING_TIMEOUT_MS } from "./protocol.js";
 
 export interface SignalingServerOptions {
   /** Port for the ephemeral signaling server (0 = random) */

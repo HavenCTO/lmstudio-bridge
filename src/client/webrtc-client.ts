@@ -20,7 +20,7 @@ import {
   LLMErrorMessage,
   createHandshake,
   negotiateVersion,
-} from "./protocol";
+} from "./protocol.js";
 
 export interface WebRTCClientEvents {
   onConnected?: () => void;
@@ -55,7 +55,9 @@ export class WebRTCClient {
    */
   async createOffer(): Promise<string> {
     const nodeDataChannel = await import("node-datachannel");
-    const { PeerConnection } = nodeDataChannel;
+    // Handle both CJS default export and ESM named export
+    const NDC = (nodeDataChannel as any).default ?? nodeDataChannel;
+    const PeerConnection = NDC.PeerConnection ?? NDC;
 
     // Create PeerConnection (local network only, no STUN/TURN)
     this.pc = new PeerConnection("client-bridge", {

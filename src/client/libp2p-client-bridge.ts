@@ -7,7 +7,7 @@
  * 4. Waits for the tunnel to be ready (TCP connectivity check)
  * 5. Starts a local HTTP proxy that forwards requests through the tunnel
  *
- * All Kubo interaction uses fetch() via ipfs-api.ts — never shells out to ipfs CLI.
+ * All Kubo interaction uses fetch() via the shared ipfs-api utility.
  * The middleware pipeline is fully preserved on the remote shim side.
  */
 
@@ -20,9 +20,9 @@ import {
   p2pClose,
   IpfsDaemonNotRunningError,
   PeerIDUnreachableError,
-} from "./utils/ipfs-api";
+} from "../utils/ipfs-api.js";
 
-export interface Libp2pBridgeOptions {
+export interface Libp2pClientBridgeOptions {
   /** Remote shim's PeerID */
   peerID: string;
   /** Libp2p protocol name */
@@ -38,8 +38,6 @@ export interface Libp2pBridgeOptions {
   /** Request timeout in ms */
   timeoutMs: number;
 }
-
-const DEFAULT_TUNNEL_PORT = 0; // Auto-assign
 
 /**
  * Wait for a TCP port to become reachable, with backoff retries.
@@ -74,8 +72,8 @@ async function waitForTunnel(
   return false;
 }
 
-export function createLibp2pBridge(
-  options: Libp2pBridgeOptions
+export function createLibp2pClientBridge(
+  options: Libp2pClientBridgeOptions
 ): { start: () => Promise<void>; shutdown: () => Promise<void> } {
   let registeredProtocol: string | null = null;
   let httpServer: ReturnType<typeof net.Server.prototype.listen> | null = null;
@@ -87,20 +85,19 @@ export function createLibp2pBridge(
 
     // 1. Verify IPFS daemon is running
     console.log(
-      `[libp2p] verifying IPFS daemon at ${options.ipfsApiUrl}...`
+      `[libp2p-client] verifying IPFS daemon at ${options.ipfsApiUrl}...`
     );
     const running = await checkDaemonRunning(apiOpts);
     if (!running) {
       throw new IpfsDaemonNotRunningError(options.ipfsApiUrl);
     }
-    console.log(`[libp2p] ✓ IPFS daemon running`);
+    console.log(`[libp2p-client] ✓ IPFS daemon running`);
 
     // 2. Verify Libp2pStreamMounting is enabled
     await checkLibp2pStreamMounting(apiOpts);
-    console.log(`[libp2p] ✓ Libp2pStreamMounting enabled`);
+    console.log(`[libp2p-client] ✓ Libp2pStreamMounting enabled`);
 
     // 3. Create p2p forward tunnel via HTTP RPC
-    // Use a fixed tunnel port (sensible default: 9191)
     if (options.tunnelPort === 0) {
       resolvedTunnelPort = 9191;
     } else {
@@ -109,7 +106,7 @@ export function createLibp2pBridge(
 
     const listenAddr = `/ip4/127.0.0.1/tcp/${resolvedTunnelPort}`;
     console.log(
-      `[libp2p] creating tunnel to PeerID: ${options.peerID}`
+      `[libp2p-client] creating tunnel to PeerID: ${options.peerID}`
     );
     await p2pForward(
       options.protocol,
@@ -119,11 +116,11 @@ export function createLibp2pBridge(
     );
     registeredProtocol = options.protocol;
     console.log(
-      `[libp2p] ✓ tunnel established: ${options.protocol} → 127.0.0.1:${resolvedTunnelPort} → /p2p/${options.peerID}`
+      `[libp2p-client] ✓ tunnel established: ${options.protocol} → 127.0.0.1:${resolvedTunnelPort} → /p2p/${options.peerID}`
     );
 
     // 4. Wait for tunnel connectivity
-    console.log(`[libp2p] waiting for tunnel connectivity...`);
+    console.log(`[libp2p-client] waiting for tunnel connectivity...`);
     const reachable = await waitForTunnel(
       "127.0.0.1",
       resolvedTunnelPort,
@@ -135,7 +132,7 @@ export function createLibp2pBridge(
         options.timeoutMs || 10000
       );
     }
-    console.log(`[libp2p] ✓ tunnel reachable`);
+    console.log(`[libp2p-client] ✓ tunnel reachable`);
 
     // 5. Start local HTTP proxy server
     const app = express();
@@ -145,6 +142,7 @@ export function createLibp2pBridge(
     app.get("/health", (_req: Request, res: Response) => {
       res.json({
         status: "ok",
+        mode: "client",
         transport: "libp2p",
         peerID: options.peerID,
         protocol: options.protocol,
@@ -181,10 +179,10 @@ export function createLibp2pBridge(
             });
           } catch (err) {
             console.warn(
-              `[libp2p] ⚠ tunnel connection lost — request failed: ${err instanceof Error ? err.message : err}`
+              `[libp2p-client] ⚠ tunnel connection lost — request failed: ${err instanceof Error ? err.message : err}`
             );
             console.warn(
-              `[libp2p] ⚠ the remote peer may have gone offline`
+              `[libp2p-client] ⚠ the remote peer may have gone offline`
             );
             res.status(503).json({
               error: {
@@ -239,7 +237,7 @@ export function createLibp2pBridge(
         } catch (err: unknown) {
           const message =
             err instanceof Error ? err.message : "Unknown error";
-          console.error(`[libp2p] proxy error:`, err);
+          console.error(`[libp2p-client] proxy error:`, err);
           res.status(502).json({
             error: {
               message: `Libp2p proxy error: ${message}`,
@@ -278,18 +276,18 @@ export function createLibp2pBridge(
         options.proxyHost,
         () => {
           console.log();
-          console.log(`[main] ✓ local OpenAI-compatible API available at:`);
+          console.log(`[client] ✓ local OpenAI-compatible API available at:`);
           console.log(
-            `[main]   POST http://${options.proxyHost}:${options.proxyPort}/v1/chat/completions`
+            `[client]   POST http://${options.proxyHost}:${options.proxyPort}/v1/chat/completions`
           );
           console.log(
-            `[main]   GET  http://${options.proxyHost}:${options.proxyPort}/v1/models`
+            `[client]   GET  http://${options.proxyHost}:${options.proxyPort}/v1/models`
           );
           console.log(
-            `[main]   GET  http://${options.proxyHost}:${options.proxyPort}/health`
+            `[client]   GET  http://${options.proxyHost}:${options.proxyPort}/health`
           );
           console.log();
-          console.log(`[main] client bridge is ready! (transport: libp2p)`);
+          console.log(`[client] client bridge is ready! (transport: libp2p)`);
           resolve();
         }
       ) as any;
@@ -313,7 +311,7 @@ export function createLibp2pBridge(
       await new Promise<void>((resolve) => {
         (httpServer as any).close(() => resolve());
       });
-      console.log(`[libp2p] ✓ local HTTP proxy closed`);
+      console.log(`[libp2p-client] ✓ local HTTP proxy closed`);
       httpServer = null;
     }
 
@@ -321,13 +319,13 @@ export function createLibp2pBridge(
     if (registeredProtocol) {
       try {
         console.log(
-          `[libp2p] closing p2p tunnel for ${registeredProtocol}...`
+          `[libp2p-client] closing p2p tunnel for ${registeredProtocol}...`
         );
         await p2pClose(registeredProtocol, { apiUrl: options.ipfsApiUrl });
-        console.log(`[libp2p] ✓ tunnel closed`);
+        console.log(`[libp2p-client] ✓ tunnel closed`);
       } catch (err) {
         console.warn(
-          `[libp2p] tunnel cleanup warning: ${err instanceof Error ? err.message : err}`
+          `[libp2p-client] tunnel cleanup warning: ${err instanceof Error ? err.message : err}`
         );
       }
       registeredProtocol = null;

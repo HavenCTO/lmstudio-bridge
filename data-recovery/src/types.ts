@@ -1,18 +1,21 @@
 /**
- * Types and Interfaces for Data Recovery Module
+ * Types and Interfaces for Data Recovery Module — V2 Architecture
+ *
+ * Aligned with the v2 archival format: flat dag-cbor conversation blocks
+ * inside standard CARv1 files with batch root provenance chain.
  */
 
 import { CID } from "multiformats/cid";
 
-// ── Conversation Data Types ─────────────────────────────────────────────────
+// ── V2 Conversation Data Types (matches ArchiveConversation) ────────────────
 
 export interface RecoveredMessage {
   role: string;
   content: string | Array<{ type: string; text?: string; image_url?: { url: string; detail?: string } }>;
+  name?: string;
 }
 
 export interface RecoveredRequest {
-  model: string;
   messages: RecoveredMessage[];
   parameters?: {
     temperature?: number;
@@ -21,49 +24,61 @@ export interface RecoveredRequest {
     frequency_penalty?: number;
     presence_penalty?: number;
     stream?: boolean;
+    [key: string]: unknown;
   };
 }
 
 export interface RecoveredChoice {
   index: number;
-  message: RecoveredMessage;
+  message: { role: string; content: string };
   finish_reason: string;
 }
 
 export interface RecoveredResponse {
   id: string;
   model: string;
+  created: number;
   choices: RecoveredChoice[];
   usage?: {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
   };
-  created: number;
 }
 
-export interface RecoveredMetadata {
-  shim_version: string;
-  capture_timestamp: number;
-  encryption?: {
-    encrypted: boolean;
-    encrypted_symmetric_key?: string;
-    access_control_conditions?: string;
-  };
-  compression?: {
-    compressed: boolean;
-    algorithm?: string;
-    original_size?: number;
-  };
-}
-
+/**
+ * A recovered conversation — matches the v2 ArchiveConversation structure.
+ * Each conversation is a single flat dag-cbor block in the CAR file.
+ */
 export interface RecoveredConversation {
-  version: string;
+  id: string;                          // requestId
+  timestamp: number;
+  model: string;
   request: RecoveredRequest;
   response: RecoveredResponse;
-  metadata: RecoveredMetadata;
+  encrypted?: boolean;
+  encryptedPayload?: Uint8Array;
+}
+
+// ── V2 Batch Root (matches BatchRoot) ───────────────────────────────────────
+
+export interface RecoveredBatchRoot {
+  version: string;
+  schemaVersion: string;
+  batchId: number;
   timestamp: number;
-  previousConversation?: CID;
+  previousBatch: CID | null;
+  conversations: CID[];
+  conversationCount: number;
+  metadata: {
+    shimVersion: string;
+    captureWindow: {
+      start: number;
+      end: number;
+    };
+    totalTokens: number;
+    models: string[];
+  };
 }
 
 // ── CAR File Types ──────────────────────────────────────────────────────────
@@ -71,13 +86,22 @@ export interface RecoveredConversation {
 export interface CarBlock {
   cid: CID;
   bytes: Uint8Array;
-  data?: unknown;
 }
 
 export interface CarFileData {
   rootCid: CID;
   blocks: Map<string, CarBlock>;
-  conversation?: RecoveredConversation;
+}
+
+/**
+ * Result of extracting a v2 batch CAR file.
+ * Contains the batch root and all conversation blocks.
+ */
+export interface BatchExtractionResult {
+  batchRoot: RecoveredBatchRoot;
+  rootCid: CID;
+  conversations: Map<string, RecoveredConversation>;  // CID string → conversation
+  blockCount: number;
 }
 
 // ── Encryption Types ────────────────────────────────────────────────────────
@@ -105,7 +129,7 @@ export interface AccessControlCondition {
   };
 }
 
-// ── Synapse/Filecoin Types ─────────────────────────────────────────────────-
+// ── Synapse/Filecoin Types ──────────────────────────────────────────────────
 
 export interface SynapseRetrievalOptions {
   /** RPC URL for Filecoin network */

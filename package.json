@@ -14,7 +14,6 @@
     "test": "jest --testPathIgnorePatterns='e2e'",
     "test:watch": "jest --watch --testPathIgnorePatterns='e2e'",
     "test:coverage": "jest --coverage --testPathIgnorePatterns='e2e'",
-    "test:e2e": "node --loader ts-node/esm tests/e2e-ipld-flow.ts",
     "test:taco": "jest tests/taco --testPathIgnorePatterns='e2e'",
     "test:taco:integration": "TEST_TACO_INTEGRATION_TEST=1 jest tests/taco/e2e.test.ts",
     "test:taco:e2e": "node --loader ts-node/esm tests/taco/e2e.test.ts",
@@ -31,21 +30,19 @@
   "license": "MIT",
   "dependencies": {
     "@ipld/car": "^5.0.0",
-    "@ipld/dag-json": "^10.0.0",
+    "@ipld/dag-cbor": "^9.0.0",
     "@lmstudio/sdk": "^1.5.0",
     "@nucypher/taco": "0.7.0-alpha.12",
     "@nucypher/taco-auth": "0.4.0-alpha.12",
     "commander": "14.0.3",
     "ethers": "5.7.2",
     "express": "5.2.1",
-    "ipns": "^9.0.0",
     "multiformats": "^13.4.2",
     "parquetjs-lite": "^0.8.7",
     "uuid": "13.0.0"
   },
   "devDependencies": {
     "@jest/globals": "^30.3.0",
-    "@types/better-sqlite3": "^7.6.12",
     "@types/express": "5.0.6",
     "@types/jest": "^29.5.14",
     "@types/node": "25.3.0",
@@ -56,7 +53,6 @@
     "typescript": "5.9.3"
   },
   "optionalDependencies": {
-    "better-sqlite3": "^9.6.0",
     "filecoin-pin": "^0.16.0",
     "node-datachannel": "0.32.1"
   }

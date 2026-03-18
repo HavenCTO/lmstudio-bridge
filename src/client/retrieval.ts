@@ -7,14 +7,72 @@
  * @module client/retrieval
  */
 
-import {
-  fetchWithFallback,
-  fetchAndVerify,
-  traverseVerified,
-  VerificationCodec,
-  GatewayConfig,
-  DEFAULT_GATEWAYS,
-} from "../lib/cid-verify";
+// ── Gateway types (previously from cid-verify, now inline) ──────────────────
+
+export interface GatewayConfig {
+  url: string;
+  name?: string;
+}
+
+export type VerificationCodec = "dag-json" | "dag-cbor" | "raw";
+
+export const DEFAULT_GATEWAYS: GatewayConfig[] = [
+  { url: "https://dweb.link", name: "dweb.link" },
+  { url: "https://w3s.link", name: "w3s.link" },
+  { url: "https://ipfs.io", name: "ipfs.io" },
+];
+
+// ── Stub fetch functions (gateway retrieval not implemented in v2) ───────────
+
+async function fetchWithFallback(
+  cid: string,
+  gateways: GatewayConfig[],
+  options: { codec?: VerificationCodec; timeoutMs?: number } = {}
+): Promise<{ data: Uint8Array; gateway: string }> {
+  for (const gw of gateways) {
+    try {
+      return await fetchAndVerify(cid, gw.url, options);
+    } catch {
+      continue;
+    }
+  }
+  throw new Error(`Failed to fetch CID ${cid} from any gateway`);
+}
+
+async function fetchAndVerify(
+  cid: string,
+  gatewayUrl: string,
+  options: { codec?: VerificationCodec; timeoutMs?: number } = {}
+): Promise<{ data: Uint8Array; gateway: string }> {
+  const url = `${gatewayUrl}/ipfs/${cid}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 60000);
+
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+    const buffer = await response.arrayBuffer();
+    return { data: new Uint8Array(buffer), gateway: gatewayUrl };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function traverseVerified(
+  rootCid: string,
+  path: string,
+  gateways?: GatewayConfig[]
+): Promise<Array<{ verified: boolean; data?: Uint8Array; error?: string }>> {
+  const gws = gateways ?? DEFAULT_GATEWAYS;
+  try {
+    const result = await fetchWithFallback(`${rootCid}/${path}`, gws);
+    return [{ verified: true, data: result.data }];
+  } catch (err) {
+    return [{ verified: false, error: err instanceof Error ? err.message : String(err) }];
+  }
+}
 import { OpenAIChatCompletionRequest, OpenAIChatCompletionResponse } from "../types";
 
 // ── Types ───────────────────────────────────────────────────────────────────

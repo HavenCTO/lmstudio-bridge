@@ -1,21 +1,22 @@
 /**
- * CAR File Extraction Module
+ * CAR File Extraction Module — V2 Architecture
  *
- * Handles parsing of CAR (Content Addressable aRchive) files,
- * extracting IPLD blocks, and reconstructing conversation data.
+ * Reads standard CARv1 files containing v2 batch archives.
+ * Each CAR has one batch root block + N flat conversation blocks (dag-cbor).
+ * No IPLD link dereferencing needed — conversations are self-contained.
  */
 
-import * as dagJson from "@ipld/dag-json";
+import * as dagCbor from "@ipld/dag-cbor";
 import { CID } from "multiformats/cid";
 import { CarReader } from "@ipld/car";
+import * as fs from "fs";
+import * as path from "path";
 import {
   CarFileData,
   CarBlock,
   RecoveredConversation,
-  RecoveredRequest,
-  RecoveredResponse,
-  RecoveredMetadata,
-  RecoveredMessage,
+  RecoveredBatchRoot,
+  BatchExtractionResult,
 } from "../types";
 
 // ── CAR File Parsing ────────────────────────────────────────────────────────
@@ -28,7 +29,7 @@ export async function parseCarFile(carBytes: Uint8Array): Promise<CarFileData> {
 
   const reader = await CarReader.fromBytes(carBytes);
   const roots = await reader.getRoots();
-  
+
   if (roots.length === 0) {
     throw new Error("CAR file has no root CIDs");
   }
@@ -55,169 +56,79 @@ export async function parseCarFile(carBytes: Uint8Array): Promise<CarFileData> {
 }
 
 /**
- * Get block data as parsed JSON
+ * Decode a dag-cbor block
  */
-export function getBlockData<T>(blocks: Map<string, CarBlock>, cid: CID | string): T | null {
-  const cidStr = typeof cid === "string" ? cid : cid.toString();
-  const block = blocks.get(cidStr);
-  
-  if (!block) {
-    console.warn(`[car] Block not found: ${cidStr}`);
-    return null;
-  }
-
-  try {
-    return dagJson.decode(block.bytes) as T;
-  } catch (error) {
-    console.warn(`[car] Failed to decode block ${cidStr}:`, error);
-    return null;
-  }
+export function decodeBlock<T>(block: CarBlock): T {
+  return dagCbor.decode(block.bytes) as unknown as T;
 }
 
-// ── IPLD Dereferencing ──────────────────────────────────────────────────────
+// ── V2 Batch Extraction ─────────────────────────────────────────────────────
 
 /**
- * Recursively dereference IPLD links in a data structure
+ * Extract a complete v2 batch from a CAR file.
+ *
+ * V2 format: one batch root block + N flat conversation blocks.
+ * No DAG traversal needed — each conversation is a single self-contained block.
  */
-export async function dereferenceIpldLinks<T>(
-  data: unknown,
-  blocks: Map<string, CarBlock>
-): Promise<T> {
-  if (data === null || data === undefined) {
-    return data as T;
+export async function extractBatch(
+  carData: CarFileData
+): Promise<BatchExtractionResult> {
+  console.log(`[car] Extracting v2 batch from CAR...`);
+
+  // Decode the batch root
+  const rootBlock = carData.blocks.get(carData.rootCid.toString());
+  if (!rootBlock) {
+    throw new Error("Batch root block not found in CAR");
   }
 
-  if (typeof data !== "object") {
-    return data as T;
+  const batchRoot = decodeBlock<RecoveredBatchRoot>(rootBlock);
+
+  if (!batchRoot.version || !batchRoot.conversations) {
+    throw new Error("Invalid v2 batch root: missing version or conversations field");
   }
 
-  // Check for CID link format: { "/": "cid-string" }
-  if (Object.keys(data).length === 1 && typeof (data as Record<string, unknown>).["/"] === "string") {
-    const cidStr = (data as Record<string, string>).["/"];
-    const cid = CID.parse(cidStr);
-    const blockData = getBlockData(blocks, cid);
-    
-    if (blockData !== null) {
-      return dereferenceIpldLinks<T>(blockData, blocks);
+  console.log(`[car] Batch v${batchRoot.version}, ${batchRoot.conversationCount} conversations`);
+
+  // Extract each conversation block referenced by the root
+  const conversations = new Map<string, RecoveredConversation>();
+
+  for (const convCid of batchRoot.conversations) {
+    const cidStr = convCid.toString();
+    const convBlock = carData.blocks.get(cidStr);
+
+    if (!convBlock) {
+      console.warn(`[car] Conversation block not found: ${cidStr}`);
+      continue;
     }
-    
-    throw new Error(`Could not dereference CID: ${cidStr}`);
+
+    const conversation = decodeBlock<RecoveredConversation>(convBlock);
+    conversations.set(cidStr, conversation);
   }
 
-  // Recurse into arrays
-  if (Array.isArray(data)) {
-    const result = [];
-    for (const item of data) {
-      result.push(await dereferenceIpldLinks(item, blocks));
-    }
-    return result as T;
-  }
+  console.log(`[car] Extracted ${conversations.size} conversations from batch`);
 
-  // Recurse into objects
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(data)) {
-    result[key] = await dereferenceIpldLinks(value, blocks);
-  }
-
-  return result as T;
-}
-
-// ── Conversation Reconstruction ─────────────────────────────────────────────
-
-/**
- * Reconstruct a complete conversation from CAR file blocks
- */
-export async function extractConversation(
-  carData: CarFileData
-): Promise<RecoveredConversation> {
-  console.log(`[car] Reconstructing conversation from blocks...`);
-
-  // Get conversation root
-  const conversationRoot = getBlockData<Record<string, unknown>>(
-    carData.blocks,
-    carData.rootCid
-  );
-
-  if (!conversationRoot) {
-    throw new Error("Could not find conversation root block");
-  }
-
-  // Dereference all links
-  const conversation = await dereferenceIpldLinks<RecoveredConversation>(
-    conversationRoot,
-    carData.blocks
-  );
-
-  console.log(`[car] Conversation reconstructed: model=${conversation.request.model}`);
-
-  return conversation;
+  return {
+    batchRoot,
+    rootCid: carData.rootCid,
+    conversations,
+    blockCount: carData.blocks.size,
+  };
 }
 
 /**
- * Extract just the request portion of a conversation
+ * Extract a single conversation from a batch CAR by its CID
  */
-export async function extractRequest(
-  carData: CarFileData
-): Promise<RecoveredRequest> {
-  const conversation = await extractConversation(carData);
-  return conversation.request;
-}
-
-/**
- * Extract just the response portion of a conversation
- */
-export async function extractResponse(
-  carData: CarFileData
-): Promise<RecoveredResponse> {
-  const conversation = await extractConversation(carData);
-  return conversation.response;
-}
-
-/**
- * Extract metadata from a conversation
- */
-export async function extractMetadata(
-  carData: CarFileData
-): Promise<RecoveredMetadata> {
-  const conversation = await extractConversation(carData);
-  return conversation.metadata;
-}
-
-// ── Partial Extraction ──────────────────────────────────────────────────────
-
-/**
- * Extract a specific message by index from a conversation
- */
-export async function extractMessage(
+export async function extractConversationByCid(
   carData: CarFileData,
-  messageIndex: number
-): Promise<RecoveredMessage | null> {
-  const conversation = await extractConversation(carData);
-  
-  if (messageIndex < 0 || messageIndex >= conversation.request.messages.length) {
-    console.warn(`[car] Message index ${messageIndex} out of range`);
+  conversationCid: string
+): Promise<RecoveredConversation | null> {
+  const block = carData.blocks.get(conversationCid);
+  if (!block) {
+    console.warn(`[car] Conversation block not found: ${conversationCid}`);
     return null;
   }
 
-  return conversation.request.messages[messageIndex];
-}
-
-/**
- * Extract system prompt if present
- */
-export async function extractSystemPrompt(
-  carData: CarFileData
-): Promise<string | null> {
-  const conversation = await extractConversation(carData);
-  
-  if (conversation.request.messages.length > 0) {
-    const firstMessage = conversation.request.messages[0];
-    if (firstMessage.role === "system" && typeof firstMessage.content === "string") {
-      return firstMessage.content;
-    }
-  }
-  
-  return null;
+  return decodeBlock<RecoveredConversation>(block);
 }
 
 // ── Export Utilities ────────────────────────────────────────────────────────
@@ -225,109 +136,106 @@ export async function extractSystemPrompt(
 export interface ExportOptions {
   /** Output format */
   format?: "json" | "pretty-json" | "ndjson";
-  /** Include raw CAR bytes */
-  includeCar?: boolean;
-  /** Include individual blocks */
-  includeBlocks?: boolean;
 }
 
 /**
- * Export extracted conversation to various formats
+ * Export a recovered conversation to string
  */
 export function exportConversation(
   conversation: RecoveredConversation,
   options: ExportOptions = {}
 ): string {
   const format = options.format ?? "pretty-json";
-  const exportData: Record<string, unknown> = {
-    conversation,
-  };
-
-  if (options.includeCar) {
-    // Note: CAR bytes would need to be passed separately
-    console.warn("[car] includeCar option requires CAR bytes to be provided separately");
-  }
-
-  if (options.includeBlocks) {
-    console.warn("[car] includeBlocks option requires block data to be provided separately");
-  }
 
   switch (format) {
     case "json":
-      return JSON.stringify(exportData);
+      return JSON.stringify(conversation);
     case "pretty-json":
-      return JSON.stringify(exportData, null, 2);
+      return JSON.stringify(conversation, null, 2);
     case "ndjson":
-      return JSON.stringify(conversation.request) + "\n" + JSON.stringify(conversation.response);
+      return JSON.stringify(conversation);
     default:
-      return JSON.stringify(exportData, null, 2);
+      return JSON.stringify(conversation, null, 2);
   }
 }
 
 /**
- * Save extracted conversation to file
+ * Export an entire batch to string (all conversations)
  */
-import * as fs from "fs";
-import * as path from "path";
+export function exportBatch(
+  result: BatchExtractionResult,
+  options: ExportOptions = {}
+): string {
+  const format = options.format ?? "pretty-json";
 
-export async function saveConversationToFile(
-  carData: CarFileData,
+  const output = {
+    batchId: result.batchRoot.batchId,
+    version: result.batchRoot.version,
+    rootCid: result.rootCid.toString(),
+    conversationCount: result.conversations.size,
+    metadata: result.batchRoot.metadata,
+    previousBatch: result.batchRoot.previousBatch?.toString() ?? null,
+    conversations: [...result.conversations.entries()].map(([cid, conv]) => ({
+      cid,
+      ...conv,
+    })),
+  };
+
+  switch (format) {
+    case "json":
+      return JSON.stringify(output);
+    case "pretty-json":
+      return JSON.stringify(output, null, 2);
+    case "ndjson":
+      return [...result.conversations.values()]
+        .map((conv) => JSON.stringify(conv))
+        .join("\n") + "\n";
+    default:
+      return JSON.stringify(output, null, 2);
+  }
+}
+
+/**
+ * Save extracted batch to file
+ */
+export async function saveBatchToFile(
+  result: BatchExtractionResult,
   outputPath: string,
   options: ExportOptions = {}
 ): Promise<void> {
-  const conversation = await extractConversation(carData);
-  const content = exportConversation(conversation, options);
+  const content = exportBatch(result, options);
 
-  // Ensure directory exists
   const dir = path.dirname(outputPath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
 
   fs.writeFileSync(outputPath, content, "utf-8");
-  console.log(`[car] Saved conversation to: ${outputPath}`);
-}
-
-// ── Batch Extraction ────────────────────────────────────────────────────────
-
-export interface BatchExtractionResult {
-  cid: string;
-  success: boolean;
-  conversation?: RecoveredConversation;
-  error?: string;
+  console.log(`[car] Saved batch to: ${outputPath}`);
 }
 
 /**
- * Extract conversations from multiple CAR files
+ * Save individual conversations from a batch to separate files
  */
-export async function batchExtractConversations(
-  carDatas: CarFileData[]
-): Promise<BatchExtractionResult[]> {
-  console.log(`[car] Extracting ${carDatas.length} conversations...`);
-
-  const results: BatchExtractionResult[] = [];
-
-  for (const carData of carDatas) {
-    try {
-      const conversation = await extractConversation(carData);
-      results.push({
-        cid: carData.rootCid.toString(),
-        success: true,
-        conversation,
-      });
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      results.push({
-        cid: carData.rootCid.toString(),
-        success: false,
-        error: errorMessage,
-      });
-      console.error(`[car] Failed to extract ${carData.rootCid}:`, errorMessage);
-    }
+export async function saveConversationsToDir(
+  result: BatchExtractionResult,
+  outputDir: string,
+  options: ExportOptions = {}
+): Promise<string[]> {
+  if (!fs.existsSync(outputDir)) {
+    fs.mkdirSync(outputDir, { recursive: true });
   }
 
-  const successCount = results.filter(r => r.success).length;
-  console.log(`[car] Extracted ${successCount}/${results.length} conversations successfully`);
+  const savedPaths: string[] = [];
 
-  return results;
+  for (const [cidStr, conv] of result.conversations) {
+    const filename = `${conv.id || cidStr}.json`;
+    const filePath = path.join(outputDir, filename);
+    const content = exportConversation(conv, options);
+    fs.writeFileSync(filePath, content, "utf-8");
+    savedPaths.push(filePath);
+  }
+
+  console.log(`[car] Saved ${savedPaths.length} conversations to: ${outputDir}`);
+  return savedPaths;
 }

@@ -1,54 +1,54 @@
 /**
- * CLI Entry Point for LM Studio Bridge Data Recovery
+ * CLI Entry Point for LM Studio Bridge Data Recovery — V2 Architecture
  *
  * Usage:
- *   lmbridge-recover recover <CID> [options]    Recover a single conversation
- *   lmbridge-recover recover-all [options]      Recover all CIDs from metadata
- *   lmbridge-recover list [options]             List available CIDs
- *   lmbridge-recover decrypt <CID> [options]    Decrypt encrypted data
- *   lmbridge-recover extract <CAR-file>         Extract from local CAR file
+ *   lmbridge-recover recover <CID> [options]       Recover a batch by CID
+ *   lmbridge-recover recover-all [options]          Recover all batches from registry
+ *   lmbridge-recover list [options]                 List batches from registry
+ *   lmbridge-recover extract <CAR-file> [options]   Extract from local CAR file
  */
 
 import { Command } from "commander";
 import * as fs from "fs";
 import * as path from "path";
 import {
-  recoverConversation,
-  recoverConversations,
-  listAvailableCids,
-  EncryptedPayloadRecoveryOptions,
+  recoverBatch,
+  recoverBatches,
+  listBatchesFromRegistry,
 } from "./lib/recovery";
+import { loadLocalCarFile } from "./lib/retriever";
+import { parseCarFile, extractBatch, saveBatchToFile, saveConversationsToDir } from "./lib/car-extractor";
 import { TacoDecryptionOptions } from "./lib/decryptor";
-import { loadLocalCarFile, parseCarFile, extractConversation } from "./lib/car-extractor";
 
 const program = new Command();
 
 program
   .name("lmbridge-recover")
-  .description("LM Studio Bridge Data Recovery Tool")
-  .version("1.0.0");
+  .description("LM Studio Bridge Data Recovery Tool (v2 format)")
+  .version("2.0.0");
 
 // ── Recover Command ─────────────────────────────────────────────────────────
 
 program
   .command("recover <cid>")
-  .description("Recover a single conversation from IPFS by CID")
+  .description("Recover a batch from IPFS by CID (v2 batch format)")
   .option("-g, --gateway <url>", "IPFS gateway URL", "https://ipfs.io")
   .option("-o, --output <dir>", "Output directory", "./recovered")
+  .option("--split", "Save individual conversations as separate files")
+  .option("--format <format>", "Output format: json, pretty-json, ndjson", "pretty-json")
   .option("--skip-decryption", "Skip decryption even if data is encrypted")
-  .option("--tacO-domain <domain>", "TACo domain (e.g., lynx, ursula)")
-  .option("--tacO-ritual-id <id>", "TACo ritual ID", "27")
-  .option("--tacO-private-key <key>", "TACo private key for authentication")
+  .option("--taco-domain <domain>", "TACo domain (e.g., lynx, ursula)")
+  .option("--taco-ritual-id <id>", "TACo ritual ID", "27")
+  .option("--taco-private-key <key>", "TACo private key for authentication")
   .option("--rpc-url <url>", "Blockchain RPC URL")
   .option("--save-car", "Save raw CAR files to output directory")
   .option("--verbose", "Enable verbose logging")
   .action(async (cid, options) => {
-    console.log("\n🔧 LM Studio Bridge Data Recovery\n");
+    console.log("\n🔧 LM Studio Bridge Data Recovery (v2)\n");
     console.log(`CID: ${cid}`);
     console.log(`Gateway: ${options.gateway}`);
     console.log(`Output: ${options.output}\n`);
 
-    // Prepare TACo options if encryption might be needed
     const tacoOptions: TacoDecryptionOptions | undefined =
       options.tacoDomain || options.tacoRitualId || options.tacoPrivateKey || options.rpcUrl
         ? {
@@ -59,7 +59,7 @@ program
           }
         : undefined;
 
-    const result = await recoverConversation(
+    const result = await recoverBatch(
       { type: "cid", cid },
       {
         outputDir: options.output,
@@ -68,12 +68,18 @@ program
         tacoOptions,
         verbose: options.verbose,
         saveCarFiles: options.saveCar,
+        splitConversations: options.split,
+        format: options.format,
       }
     );
 
     if (result.success) {
       console.log(`\n✅ Recovery successful!`);
-      console.log(`   Output: ${result.outputPath}`);
+      console.log(`   Batch output: ${result.outputPath}`);
+      console.log(`   Conversations: ${result.batch?.conversations.size ?? 0}`);
+      if (result.conversationPaths) {
+        console.log(`   Individual files: ${result.conversationPaths.length}`);
+      }
       if (result.warnings?.length) {
         console.log("\n⚠️  Warnings:");
         result.warnings.forEach(w => console.log(`   - ${w}`));
@@ -89,29 +95,30 @@ program
 
 program
   .command("recover-all")
-  .description("Recover all conversations from metadata directory or CID list file")
-  .option("-m, --metadata-dir <dir>", "Directory containing metadata JSON files")
+  .description("Recover all batches from a v2 registry file or CID list")
+  .option("-r, --registry <file>", "Path to v2 registry.json file")
   .option("-c, --cid-file <file>", "File containing list of CIDs (one per line)")
   .option("-g, --gateway <url>", "IPFS gateway URL", "https://ipfs.io")
   .option("-o, --output <dir>", "Output directory", "./recovered")
+  .option("--split", "Save individual conversations as separate files")
+  .option("--format <format>", "Output format: json, pretty-json, ndjson", "pretty-json")
   .option("--skip-decryption", "Skip decryption even if data is encrypted")
-  .option("--tacO-domain <domain>", "TACo domain")
-  .option("--tacO-ritual-id <id>", "TACo ritual ID", "27")
-  .option("--tacO-private-key <key>", "TACo private key")
+  .option("--taco-domain <domain>", "TACo domain")
+  .option("--taco-ritual-id <id>", "TACo ritual ID", "27")
+  .option("--taco-private-key <key>", "TACo private key")
   .option("--rpc-url <url>", "Blockchain RPC URL")
   .option("--save-car", "Save raw CAR files")
   .option("--verbose", "Enable verbose logging")
   .action(async (options) => {
-    console.log("\n🔧 LM Studio Bridge Data Recovery (Batch Mode)\n");
+    console.log("\n🔧 LM Studio Bridge Data Recovery — Batch Mode (v2)\n");
 
-    // Get list of CIDs to recover
     let cidsToRecover: string[] = [];
 
-    if (options.metadataDir) {
-      console.log(`Loading CIDs from metadata directory: ${options.metadataDir}`);
-      const available = await listAvailableCids(options.metadataDir);
-      cidsToRecover = available.map(m => m.cid);
-      console.log(`Found ${cidsToRecover.length} CIDs\n`);
+    if (options.registry) {
+      console.log(`Loading batches from registry: ${options.registry}`);
+      const batches = await listBatchesFromRegistry(options.registry);
+      cidsToRecover = batches.map(b => b.filecoinCid);
+      console.log(`Found ${cidsToRecover.length} batches\n`);
     } else if (options.cidFile) {
       if (!fs.existsSync(options.cidFile)) {
         console.error(`CID file not found: ${options.cidFile}`);
@@ -124,16 +131,15 @@ program
         .filter(line => line.length > 0 && !line.startsWith("#"));
       console.log(`Loaded ${cidsToRecover.length} CIDs from ${options.cidFile}\n`);
     } else {
-      console.error("Error: Must specify --metadata-dir or --cid-file");
+      console.error("Error: Must specify --registry or --cid-file");
       process.exit(1);
     }
 
     if (cidsToRecover.length === 0) {
-      console.log("No CIDs to recover.");
+      console.log("No batches to recover.");
       return;
     }
 
-    // Prepare TACo options
     const tacoOptions: TacoDecryptionOptions | undefined =
       options.tacoDomain || options.tacoRitualId || options.tacoPrivateKey || options.rpcUrl
         ? {
@@ -144,8 +150,7 @@ program
           }
         : undefined;
 
-    // Recover all
-    const results = await recoverConversations(
+    const results = await recoverBatches(
       cidsToRecover.map(cid => ({ type: "cid" as const, cid })),
       {
         outputDir: options.output,
@@ -154,23 +159,18 @@ program
         tacoOptions,
         verbose: options.verbose,
         saveCarFiles: options.saveCar,
+        splitConversations: options.split,
+        format: options.format,
       }
     );
 
-    // Print summary
     const success = results.filter(r => r.success).length;
     const failed = results.filter(r => !r.success).length;
-    
-    console.log(`\n${"=".repeat(40)}`);
-    console.log(`Batch Recovery Complete`);
-    console.log(`${"=".repeat(40)}`);
-    console.log(`Success: ${success}/${results.length}`);
-    console.log(`Failed: ${failed}/${results.length}`);
 
     if (failed > 0) {
-      console.log("\nFailed CIDs:");
+      console.log("\nFailed batches:");
       results.filter(r => !r.success).forEach(r => {
-        console.log(`  - ${r.cid}: ${r.error}`);
+        console.log(`  - ${r.source}: ${r.error}`);
       });
       process.exit(1);
     }
@@ -180,99 +180,39 @@ program
 
 program
   .command("list")
-  .description("List available CIDs from metadata directory")
-  .option("-m, --metadata-dir <dir>", "Directory containing metadata JSON files", "./data")
+  .description("List batches from a v2 registry file")
+  .option("-r, --registry <file>", "Path to v2 registry.json file", "./registry.json")
   .option("--json", "Output in JSON format")
   .action(async (options) => {
-    if (!fs.existsSync(options.metadataDir)) {
-      console.error(`Metadata directory not found: ${options.metadataDir}`);
+    if (!fs.existsSync(options.registry)) {
+      console.error(`Registry file not found: ${options.registry}`);
       process.exit(1);
     }
 
-    const available = await listAvailableCids(options.metadataDir);
+    const batches = await listBatchesFromRegistry(options.registry);
 
     if (options.json) {
-      console.log(JSON.stringify(available, null, 2));
+      console.log(JSON.stringify(batches, null, 2));
     } else {
-      console.log(`\n📋 Available CIDs (${available.length} total)\n`);
-      
-      if (available.length === 0) {
-        console.log("No CIDs found in metadata directory.");
+      console.log(`\n📋 V2 Batches (${batches.length} total)\n`);
+
+      if (batches.length === 0) {
+        console.log("No batches found in registry.");
         return;
       }
 
-      for (const item of available) {
-        const status = item.encrypted ? "🔐" : "📄";
-        console.log(`${status} ${item.cid}`);
-        if (item.timestamp) {
-          console.log(`   Timestamp: ${item.timestamp}`);
-        }
-        if (item.size) {
-          console.log(`   Size: ${item.size} bytes`);
-        }
+      for (const batch of batches) {
+        const date = new Date(batch.createdAt).toISOString();
+        const chain = batch.previousBatchCid ? `← ${batch.previousBatchCid.substring(0, 16)}...` : "(genesis)";
+        console.log(`📦 Batch #${batch.batchId}`);
+        console.log(`   Root CID:      ${batch.rootCid}`);
+        console.log(`   Filecoin CID:  ${batch.filecoinCid}`);
+        console.log(`   Conversations: ${batch.conversationCount}`);
+        console.log(`   CAR size:      ${batch.carSize} bytes`);
+        console.log(`   Created:       ${date}`);
+        console.log(`   Chain:         ${chain}`);
+        console.log();
       }
-    }
-  });
-
-// ── Decrypt Command ─────────────────────────────────────────────────────────
-
-program
-  .command("decrypt <cid>")
-  .description("Decrypt an encrypted conversation")
-  .option("-g, --gateway <url>", "IPFS gateway URL", "https://ipfs.io")
-  .option("-o, --output <dir>", "Output directory", "./decrypted")
-  .option("--tacO-domain <domain>", "TACo domain (required)", "lynx")
-  .option("--tacO-ritual-id <id>", "TACo ritual ID", "27")
-  .option("--tacO-private-key <key>", "TACo private key (required)")
-  .option("--rpc-url <url>", "Blockchain RPC URL")
-  .action(async (cid, options) => {
-    console.log("\n🔐 TACo Decryption\n");
-    console.log(`CID: ${cid}`);
-    console.log(`TACo Domain: ${options.tacoDomain}`);
-    console.log(`Ritual ID: ${options.tacoRitualId}`);
-
-    if (!options.tacoPrivateKey) {
-      console.error("\n❌ Error: --tacO-private-key is required for decryption");
-      process.exit(1);
-    }
-
-    try {
-      // Retrieve and parse CAR
-      const { retrieveFromGateway } = await import("./lib/retriever");
-      const retrieval = await retrieveFromGateway(cid, {
-        gatewayUrl: options.gateway,
-      });
-
-      const carData = await parseCarFile(retrieval.carBytes);
-      const conversation = await extractConversation(carData);
-
-      console.log(`\nConversation retrieved: ${conversation.request.model}`);
-      console.log(`Messages: ${conversation.request.messages.length}`);
-
-      // Note: Full decryption requires the encrypted buffer
-      // This would typically come from the upload metadata
-      console.log("\n⚠️  Note: Full decryption requires the encrypted payload buffer");
-      console.log("   which is stored separately from the IPLD conversation data.");
-      console.log("   Check your upload logs or metadata files for the encrypted buffer location.");
-
-      // Save what we can
-      const outputPath = path.join(options.output, `${cid}-metadata.json`);
-      fs.mkdirSync(options.output, { recursive: true });
-      fs.writeFileSync(
-        outputPath,
-        JSON.stringify({
-          cid,
-          conversation,
-          metadata: conversation.metadata,
-          decryptionNote: "Encrypted payload requires separate retrieval",
-        }, null, 2),
-        "utf-8"
-      );
-
-      console.log(`\nSaved metadata to: ${outputPath}`);
-    } catch (error) {
-      console.error("\n❌ Decryption failed:", error instanceof Error ? error.message : String(error));
-      process.exit(1);
     }
   });
 
@@ -280,11 +220,12 @@ program
 
 program
   .command("extract <car-file>")
-  .description("Extract conversation from a local CAR file")
-  .option("-o, --output <path>", "Output file path")
+  .description("Extract a v2 batch from a local CAR file")
+  .option("-o, --output <path>", "Output file or directory path")
+  .option("--split", "Save individual conversations as separate files")
   .option("--format <format>", "Output format: json, pretty-json, ndjson", "pretty-json")
   .action(async (carFile, options) => {
-    console.log("\n📦 CAR File Extraction\n");
+    console.log("\n📦 V2 CAR File Extraction\n");
     console.log(`File: ${carFile}`);
 
     if (!fs.existsSync(carFile)) {
@@ -295,31 +236,45 @@ program
     try {
       const retrieval = await loadLocalCarFile(carFile);
       const carData = await parseCarFile(retrieval.carBytes);
-      const conversation = await extractConversation(carData);
+      const batch = await extractBatch(carData);
 
-      console.log(`\n✅ Successfully extracted conversation`);
-      console.log(`   Model: ${conversation.request.model}`);
-      console.log(`   Messages: ${conversation.request.messages.length}`);
-      console.log(`   Root CID: ${carData.rootCid}`);
+      console.log(`\n✅ Successfully extracted v2 batch`);
+      console.log(`   Version:       ${batch.batchRoot.version}`);
+      console.log(`   Batch ID:      ${batch.batchRoot.batchId}`);
+      console.log(`   Conversations: ${batch.conversations.size}`);
+      console.log(`   Models:        ${batch.batchRoot.metadata.models.join(", ")}`);
+      console.log(`   Total tokens:  ${batch.batchRoot.metadata.totalTokens}`);
+      console.log(`   Root CID:      ${batch.rootCid}`);
 
-      // Determine output path
-      let outputPath = options.output;
-      if (!outputPath) {
-        const baseName = path.basename(carFile, ".car");
-        outputPath = path.join(process.cwd(), `${baseName}-extracted.json`);
+      if (batch.batchRoot.previousBatch) {
+        console.log(`   Prev batch:    ${batch.batchRoot.previousBatch.toString()}`);
       }
 
-      // Ensure directory exists
-      const dir = path.dirname(outputPath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
+      // Determine output
+      const outputDir = options.output ?? process.cwd();
+
+      if (options.split) {
+        const convDir = path.join(outputDir, `batch-${batch.batchRoot.batchId}-conversations`);
+        const paths = await saveConversationsToDir(batch, convDir, { format: options.format });
+        console.log(`\nSaved ${paths.length} conversations to: ${convDir}`);
+      } else {
+        const outputPath = path.isAbsolute(outputDir)
+          ? outputDir
+          : path.join(process.cwd(), outputDir);
+
+        // If output looks like a directory, put batch file inside it
+        let finalPath: string;
+        if (outputPath.endsWith(".json") || outputPath.endsWith(".ndjson")) {
+          finalPath = outputPath;
+        } else {
+          fs.mkdirSync(outputPath, { recursive: true });
+          const baseName = path.basename(carFile, ".car");
+          finalPath = path.join(outputPath, `${baseName}-extracted.json`);
+        }
+
+        await saveBatchToFile(batch, finalPath, { format: options.format });
+        console.log(`\nSaved to: ${finalPath}`);
       }
-
-      // Write output
-      const output = JSON.stringify(conversation, null, 2);
-      fs.writeFileSync(outputPath, output, "utf-8");
-
-      console.log(`\nSaved to: ${outputPath}`);
     } catch (error) {
       console.error("\n❌ Extraction failed:", error instanceof Error ? error.message : String(error));
       process.exit(1);
