@@ -19,6 +19,48 @@ import {
   DEFAULT_CONFIG_PATH,
 } from "./config-file.js";
 
+// ── Chain name to ID mapping ──
+const CHAIN_ID_MAP: Record<string, number> = {
+  'mainnet': 1,
+  'ethereum': 1,
+  'sepolia': 11155111,
+  'goerli': 5,
+  'polygon': 137,
+  'matic': 137,
+  'amoy': 80002,
+  'mumbai': 80001,
+  'optimism': 10,
+  'arbitrum': 42161,
+  'base': 8453,
+  'bsc': 56,
+  'binance': 56,
+  'avalanche': 43114,
+  'fantom': 250,
+};
+
+/**
+ * Convert a chain name or ID string to a numeric chain ID.
+ * Supports both named chains (e.g., "sepolia") and numeric IDs (e.g., "11155111").
+ */
+function parseChainId(input: string): number {
+  const trimmed = input.trim().toLowerCase();
+  
+  // Try parsing as number first
+  const numericId = parseInt(trimmed, 10);
+  if (!isNaN(numericId)) {
+    return numericId;
+  }
+  
+  // Look up in chain name map
+  if (CHAIN_ID_MAP[trimmed]) {
+    return CHAIN_ID_MAP[trimmed];
+  }
+  
+  // Default to Sepolia if unknown
+  console.warn(`  ⚠ Unknown chain "${input}", defaulting to Sepolia (11155111)`);
+  return 11155111;
+}
+
 /**
  * Create a readline interface for interactive prompts.
  */
@@ -361,11 +403,12 @@ export async function runConfigWizard(
         config.encryption.daoContract || ""
       );
 
-      config.encryption.daoChain = await ask(
+      const daoChainInput = await ask(
         rl,
-        "    Blockchain chain for DAO checks",
-        config.encryption.daoChain
+        "    Blockchain chain for DAO checks (name or chain ID)",
+        String(config.encryption.daoChain)
       );
+      config.encryption.daoChain = parseChainId(daoChainInput);
 
       config.encryption.daoMinBalance = await ask(
         rl,
