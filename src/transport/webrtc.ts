@@ -229,10 +229,6 @@ export function createWebRTCTransport(
 
           handleMessage(engine, peer!, raw, (response: string) => {
             try {
-              if (Buffer.byteLength(response, "utf-8") > DATACHANNEL_MAX_MESSAGE_SIZE) {
-                console.error(`[webrtc-shim] response exceeds 16KB limit, dropping`);
-                return;
-              }
               dc.sendMessage(response);
             } catch (err) {
               console.error(`[webrtc-shim] failed to send response:`, err);

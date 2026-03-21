@@ -78,6 +78,7 @@ async function main(): Promise<void> {
 
   const pc = new PeerConnection("qr-server", {
     iceServers: [],
+    maxMessageSize: DATACHANNEL_MAX_MESSAGE_SIZE,
   });
 
   // Create DataChannel (server creates it, client receives it)
@@ -241,17 +242,6 @@ async function main(): Promise<void> {
             id: reqMsg.id,
             payload: response,
           });
-
-          if (Buffer.byteLength(responseStr, "utf-8") > DATACHANNEL_MAX_MESSAGE_SIZE) {
-            console.error(`[server] response exceeds 16KB, dropping`);
-            dc.sendMessage(JSON.stringify({
-              schema_version: 1,
-              type: "llm_error",
-              id: reqMsg.id,
-              error: { code: "RESPONSE_TOO_LARGE", message: "Response exceeds DataChannel limit" },
-            }));
-            return;
-          }
 
           dc.sendMessage(responseStr);
           console.log(`[server] sent response for ${reqMsg.id}`);

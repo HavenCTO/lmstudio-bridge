@@ -156,11 +156,6 @@ export class WebRTCClient {
       payload,
     });
 
-    // Validate message size
-    if (Buffer.byteLength(message, "utf-8") > DATACHANNEL_MAX_MESSAGE_SIZE) {
-      return Promise.reject(new Error("Request exceeds 16KB DataChannel message limit"));
-    }
-
     return new Promise<Record<string, unknown>>((resolve, reject) => {
       // Set up timeout
       const timer = setTimeout(() => {
