@@ -64,7 +64,7 @@ export interface TacoEncryptionMetadata {
   tacoDomain: string;
   ritualId: number;
   condition: Record<string, unknown>;
-  chain: number; // Chain ID (e.g., 11155111 for Sepolia)
+  chain: string;
   metadataCid?: string;
 }
 
@@ -75,8 +75,8 @@ export interface TacoEncryptOptions {
   ritualId: number;
   /** DAO token contract address */
   daoContractAddress: string;
-  /** Blockchain chain ID (e.g., 11155111 for Sepolia) */
-  daoChain: number;
+  /** Blockchain chain name */
+  daoChain: string;
   /** Minimum token balance required */
   minimumBalance?: string;
   /** Optional private key for key recovery (shared key mode) */
@@ -170,9 +170,13 @@ class TacoKeyWrapper {
       
       // Build DAO token holder condition using the predefined class
       // chain must be a number (chain ID), not a string
+      const chainId = typeof this.options.daoChain === 'string' 
+        ? parseInt(this.options.daoChain, 10) 
+        : this.options.daoChain;
+      
       const condition = new ERC20Balance({
         contractAddress: this.options.daoContractAddress.toLowerCase(),
-        chain: this.options.daoChain,
+        chain: chainId,
         returnValueTest: {
           comparator: '>=',
           value: this.options.minimumBalance || '1',

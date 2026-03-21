@@ -211,17 +211,53 @@ export class WebRTCClient {
 
   private async waitForIceGatheringComplete(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      let resolved = false;
+      const done = () => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timeout);
+        clearTimeout(fallback);
+        resolve();
+      };
+
       const timeout = setTimeout(() => {
+        if (resolved) return;
+        // If we have a local description with candidates, consider it done
+        const desc = this.pc.localDescription();
+        if (desc && desc.sdp && desc.sdp.includes("a=candidate")) {
+          console.log(`[webrtc-client] ICE gathering timeout but have candidates, proceeding`);
+          done();
+          return;
+        }
         reject(new Error("ICE gathering timeout (15s)"));
       }, 15_000);
 
+      // Primary: listen for gathering state change
       this.pc.onGatheringStateChange((state: string) => {
         console.log(`[webrtc-client] ICE gathering state: ${state}`);
         if (state === "complete") {
-          clearTimeout(timeout);
-          resolve();
+          done();
         }
       });
+
+      // Secondary: listen for local candidates - once we have a host candidate
+      // for a local-only connection (no STUN/TURN), that's sufficient
+      let candidateCount = 0;
+      this.pc.onLocalCandidate((candidate: string, mid: string) => {
+        candidateCount++;
+        console.log(`[webrtc-client] ICE candidate #${candidateCount}: ${candidate.substring(0, 80)}...`);
+      });
+
+      // Fallback: after 2 seconds, if we have any candidates, proceed
+      // node-datachannel sometimes doesn't fire "complete" for local-only
+      const fallback = setTimeout(() => {
+        if (resolved) return;
+        const desc = this.pc.localDescription();
+        if (desc && desc.sdp && desc.sdp.includes("a=candidate")) {
+          console.log(`[webrtc-client] ICE fallback: have candidates after 2s, proceeding`);
+          done();
+        }
+      }, 2_000);
     });
   }
 

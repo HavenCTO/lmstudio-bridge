@@ -256,19 +256,7 @@ function applyCliOverrides(config: ShimConfig, opts: CLIOptions): void {
   if (opts.daoContract) {
     config.encryption.daoContract = opts.daoContract;
   }
-  // Parse daoChain as number (chain ID) - support both numeric and named chains
-  const chainIdMap: Record<string, number> = {
-    'mainnet': 1,
-    'sepolia': 11155111,
-    'goerli': 5,
-    'polygon': 137,
-    'amoy': 80002,
-    'mumbai': 80001,
-  };
-  const parsedChainId = parseInt(opts.daoChain, 10);
-  config.encryption.daoChain = isNaN(parsedChainId) 
-    ? (chainIdMap[opts.daoChain.toLowerCase()] || 11155111) 
-    : parsedChainId;
+  config.encryption.daoChain = opts.daoChain;
   config.encryption.daoMinBalance = opts.daoMinBalance;
   if (opts.keyMetadata) {
     config.encryption.keyMetadataPath = opts.keyMetadata;

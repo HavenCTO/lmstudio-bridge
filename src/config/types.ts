@@ -92,8 +92,8 @@ export interface EncryptionConfig {
   tacoRitualId: number;
   /** DAO token contract address for access control */
   daoContract?: string;
-  /** Blockchain chain ID for DAO token checks (e.g., 11155111 for Sepolia) */
-  daoChain: number;
+  /** Blockchain chain for DAO token checks */
+  daoChain: string;
   /** Minimum token balance required for access */
   daoMinBalance: string;
   /** Path to persist encryption key metadata JSON */
@@ -161,7 +161,7 @@ export function createDefaultConfig(): ShimConfig {
     encryption: {
       tacoDomain: "lynx",
       tacoRitualId: 27,
-      daoChain: 11155111, // Sepolia testnet chain ID
+      daoChain: "sepolia",
       daoMinBalance: "1",
     },
     libp2p: {
