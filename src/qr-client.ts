@@ -95,7 +95,7 @@ async function main(): Promise<void> {
 
   // Handle incoming DataChannel from server
   const dcReady = new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("DataChannel open timeout (30s)")), 30_000);
+    const timeout = setTimeout(() => reject(new Error("DataChannel open timeout (120s)")), 120_000);
 
     pc.onDataChannel((incomingDc: any) => {
       console.log(`[client] DataChannel received: ${incomingDc.getLabel()}`);
@@ -158,7 +158,7 @@ async function main(): Promise<void> {
           process.exit(1);
         }
       }
-    }, 15_000);
+    }, 30_000);
 
     pc.onGatheringStateChange((state: string) => {
       console.log(`[client] ICE gathering: ${state}`);
@@ -206,7 +206,7 @@ async function main(): Promise<void> {
   // Wait for handshake
   await new Promise<void>((resolve, reject) => {
     if (handshakeComplete) { resolve(); return; }
-    const timeout = setTimeout(() => reject(new Error("Handshake timeout (15s)")), 15_000);
+    const timeout = setTimeout(() => reject(new Error("Handshake timeout (60s)")), 60_000);
     const check = setInterval(() => {
       if (handshakeComplete) {
         clearInterval(check);
