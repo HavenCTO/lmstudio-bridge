@@ -170,7 +170,7 @@ async function main(): Promise<void> {
   let negotiatedVersion: number | null = null;
 
   const dcReady = new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("DataChannel open timeout (30s)")), 30_000);
+    const timeout = setTimeout(() => reject(new Error("DataChannel open timeout (300s)")), 300_000);
 
     dc.onOpen(() => {
       console.log(`[server] ✓ DataChannel "${DATACHANNEL_LABEL}" opened`);

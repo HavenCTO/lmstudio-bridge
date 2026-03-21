@@ -122,7 +122,7 @@ async function startWebRTCClient(cfg: ShimConfig): Promise<{ shutdown: () => Pro
   await Promise.race([
     readyPromise,
     new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error("Handshake timeout (30s)")), 30_000)
+      setTimeout(() => reject(new Error("Handshake timeout (300s)")), 300_000)
     ),
   ]);
 

@@ -96,7 +96,7 @@ async function main(): Promise<void> {
 
   // Handle incoming DataChannel from server
   const dcReady = new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("DataChannel open timeout (30s)")), 30_000);
+    const timeout = setTimeout(() => reject(new Error("DataChannel open timeout (300s)")), 300_000);
 
     pc.onDataChannel((incomingDc: any) => {
       console.log(`[client] DataChannel received: ${incomingDc.getLabel()}`);

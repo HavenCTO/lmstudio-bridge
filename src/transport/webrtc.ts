@@ -186,7 +186,7 @@ export function createWebRTCTransport(
         // Step 5: Handle incoming DataChannel
         const dcPromise = new Promise<any>((resolve, reject) => {
           const timeout = setTimeout(() => {
-            reject(new Error("DataChannel open timeout (30s)"));
+            reject(new Error("DataChannel open timeout (300s)"));
           }, 30_000);
 
           pc.onDataChannel((dc: any) => {
